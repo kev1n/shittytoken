@@ -6,6 +6,7 @@ throughput.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 
@@ -136,12 +137,20 @@ async def reason_about_oom(
     """
     user_prompt = build_user_prompt(ctx)
 
-    response = await anthropic_client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    try:
+        response = await asyncio.wait_for(
+            anthropic_client.messages.create(
+                model=model,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            ),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        raise OOMReasoningError("Anthropic API call timed out after 30s")
+    except anthropic.APIError as exc:
+        raise OOMReasoningError(f"Anthropic API error: {exc}") from exc
 
     raw_text = response.content[0].text
 
@@ -187,6 +196,12 @@ async def reason_about_oom(
     if max_model_len < 4096:
         raise OOMReasoningError(
             f"proposed max_model_len={max_model_len} < 4096 (safety violation)"
+        )
+
+    # Validate enable_prefix_caching
+    if not proposed.get("enable_prefix_caching", True):
+        raise OOMReasoningError(
+            "proposed_config.enable_prefix_caching must be True — prefix caching is always required"
         )
 
     # Validate loading OOM constraint: must not reduce max_model_len

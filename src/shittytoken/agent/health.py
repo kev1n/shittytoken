@@ -44,8 +44,16 @@ async def wait_for_model_ready(
                 timeout=aiohttp.ClientTimeout(total=10.0),
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
+                    try:
+                        data = await resp.json()
+                    except (ValueError, aiohttp.ContentTypeError) as exc:
+                        log.debug("worker_model_poll_json_error", error=str(exc))
+                        await asyncio.sleep(poll_interval_sec)
+                        continue
                     models = data.get("data", [])
+                    if not isinstance(models, list):
+                        await asyncio.sleep(poll_interval_sec)
+                        continue
                     if models:
                         log.info(
                             "worker_model_ready",

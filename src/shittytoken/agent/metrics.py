@@ -18,16 +18,9 @@ from dataclasses import dataclass
 import aiohttp
 import structlog
 
-logger = structlog.get_logger()
+from shittytoken.common.prometheus import parse_prometheus_text
 
-# The metrics we care about from each worker's /metrics endpoint.
-_METRICS_OF_INTEREST = frozenset(
-    {
-        "num_requests_running",
-        "num_requests_waiting",
-        "gpu_cache_usage_perc",
-    }
-)
+logger = structlog.get_logger()
 
 
 @dataclass
@@ -38,32 +31,6 @@ class AggregateMetrics:
     worker_count: int
 
 
-def _parse_prometheus_text(text: str) -> dict[str, float]:
-    """
-    Minimal Prometheus text-format parser (stdlib only).
-
-    Skips comment (#) and blank lines.  Strips label blocks.
-    Only retains metrics listed in _METRICS_OF_INTEREST.
-    """
-    result: dict[str, float] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        raw_name = parts[0]
-        raw_value = parts[1]
-        brace_pos = raw_name.find("{")
-        name = raw_name[:brace_pos] if brace_pos != -1 else raw_name
-        if name not in _METRICS_OF_INTEREST:
-            continue
-        try:
-            result[name] = float(raw_value)
-        except ValueError:
-            continue
-    return result
 
 
 async def scrape_worker_metrics(
@@ -89,7 +56,7 @@ async def scrape_worker_metrics(
                 )
                 return {}
             text = await resp.text()
-            return _parse_prometheus_text(text)
+            return parse_prometheus_text(text)
     except aiohttp.ClientError as exc:
         logger.debug("metrics_scrape_error", worker_url=worker_url, error=str(exc))
         return {}

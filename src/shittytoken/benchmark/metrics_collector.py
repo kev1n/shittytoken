@@ -1,31 +1,14 @@
 import asyncio
-import re
 import time
 from dataclasses import dataclass, field
 
 import aiohttp
 import structlog
 
+from shittytoken.common.prometheus import parse_prometheus_text
 from .constants import METRICS_SCRAPE_INTERVAL_SEC
 
 logger = structlog.get_logger()
-
-PROMETHEUS_METRICS_OF_INTEREST = [
-    "vllm:prefix_cache_queries_total",
-    "vllm:prefix_cache_hits_total",
-    "vllm:gpu_cache_usage_perc",
-    "vllm:num_requests_running",
-    "vllm:num_requests_waiting",
-]
-
-# Pre-compiled regex: matches a metric line of the form:
-#   metric_name{optional_labels} value
-# or simply:
-#   metric_name value
-# We extract: group(1) = metric name, group(2) = numeric value.
-_METRIC_LINE_RE = re.compile(
-    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+]?\S+)"
-)
 
 
 @dataclass
@@ -125,50 +108,10 @@ class MetricsCollector:
         first = phase_scrapes[0]
         last = phase_scrapes[-1]
         delta_queries = last.prefix_cache_queries - first.prefix_cache_queries
-        if delta_queries == 0:
-            return 0.0
-
         delta_hits = last.prefix_cache_hits - first.prefix_cache_hits
-        return delta_hits / delta_queries
-
-    @staticmethod
-    def parse_prometheus_text(text: str) -> dict[str, float]:
-        """
-        Minimal stdlib-only Prometheus text format parser.
-        Only extracts metrics in PROMETHEUS_METRICS_OF_INTEREST.
-        Handles comment lines (starting with #) without error.
-        No prometheus_client library dependency.
-        """
-        results: dict[str, float] = {}
-        interest_set = set(PROMETHEUS_METRICS_OF_INTEREST)
-
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            match = _METRIC_LINE_RE.match(line)
-            if match is None:
-                continue
-
-            metric_name = match.group(1)
-            if metric_name not in interest_set:
-                continue
-
-            raw_value = match.group(2)
-            try:
-                value = float(raw_value)
-            except ValueError:
-                logger.warning(
-                    "metrics_collector.parse_bad_value",
-                    metric=metric_name,
-                    raw_value=raw_value,
-                )
-                continue
-
-            results[metric_name] = value
-
-        return results
+        if delta_queries <= 0:
+            return 0.0
+        return max(0.0, min(1.0, delta_hits / delta_queries))
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -177,10 +120,12 @@ class MetricsCollector:
     async def _scrape_once(self) -> None:
         timeout = aiohttp.ClientTimeout(total=10, connect=5)
         async with self._session.get(self._metrics_url, timeout=timeout) as resp:
-            resp.raise_for_status()
             text = await resp.text()
+            if resp.status != 200:
+                logger.warning("metrics_scrape_http_error", status=resp.status)
+                return
 
-        parsed = self.parse_prometheus_text(text)
+        parsed = parse_prometheus_text(text)
         scrape = MetricsScrape(
             timestamp=time.monotonic(),
             unix_ts=time.time(),

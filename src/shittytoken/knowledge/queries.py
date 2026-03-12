@@ -84,6 +84,17 @@ async def best_config_for(
     )
 
 
+async def gpu_vram_for(driver: "AsyncDriver", gpu_model_name: str) -> int | None:
+    """Return the VRAM (in GB) for a GPUModel, or None if not found."""
+    query = "MATCH (g:GPUModel {name: $name}) RETURN g.vram_gb AS vram_gb"
+    async with driver.session() as session:
+        result = await session.run(query, name=gpu_model_name)
+        record = await result.single()
+        if record is None:
+            return None
+        return record["vram_gb"]
+
+
 async def prior_oom_resolutions(
     driver: "AsyncDriver",
     gpu_model_name: str,
@@ -158,6 +169,8 @@ async def write_configuration(driver: "AsyncDriver", config: "Configuration") ->
         result = await session.run(query, **params)
         record = await result.single()
 
+    if record is None:
+        raise RuntimeError("Expected exactly one record from query but got none")
     config_id: str = record["config_id"]
     logger.info("write_configuration.done", config_id=config_id)
     return config_id
@@ -200,6 +213,8 @@ async def write_benchmark_result(
         result = await session.run(query, **params)
         record = await result.single()
 
+    if record is None:
+        raise RuntimeError("Expected exactly one record from query but got none")
     rid: str = record["result_id"]
     logger.info("write_benchmark_result.done", result_id=rid, config_id=config_id)
     return rid
@@ -248,6 +263,8 @@ async def write_oom_event(
         result = await session.run(query, **params)
         record = await result.single()
 
+    if record is None:
+        raise RuntimeError("Expected exactly one record from query but got none")
     eid: str = record["event_id"]
     logger.info("write_oom_event.done", event_id=eid, config_id=config_id)
     return eid

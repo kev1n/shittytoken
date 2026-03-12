@@ -155,16 +155,20 @@ class RouterManager:
         self._process = None
         logger.info("router_stopped")
 
-    async def is_healthy(self) -> bool:
+    async def is_healthy(self, session: aiohttp.ClientSession | None = None) -> bool:
         """
         Probe GET http://localhost:{VLLM_ROUTER_PORT}/health.
         Returns False on any error — never raises.
         """
         url = f"http://localhost:{VLLM_ROUTER_PORT}/health"
         try:
-            async with aiohttp.ClientSession() as session:
+            if session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                     return resp.status == 200
+            else:
+                async with aiohttp.ClientSession() as temp:
+                    async with temp.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                        return resp.status == 200
         except Exception:  # noqa: BLE001 — intentional catch-all for health probe
             return False
 
@@ -182,10 +186,11 @@ class RouterManager:
         Returns True if healthy, False on timeout.
         """
         deadline = time.monotonic() + HEALTH_CHECK_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            if await self.is_healthy():
-                return True
-            await asyncio.sleep(0.5)
+        async with aiohttp.ClientSession() as session:
+            while time.monotonic() < deadline:
+                if await self.is_healthy(session):
+                    return True
+                await asyncio.sleep(0.5)
         return False
 
     async def _terminate_process(

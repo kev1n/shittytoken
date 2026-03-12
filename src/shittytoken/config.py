@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     vastai_api_key: str = ""
     runpod_api_key: str = ""
 
+    # Hugging Face
+    huggingface_token: str = ""
+
     # Anthropic
     anthropic_api_key: str = ""
     oom_reasoning_model: str = "claude-opus-4-6"
@@ -30,6 +33,9 @@ class Settings(BaseSettings):
     # SSH
     ssh_private_key_path: str = "~/.ssh/id_rsa"
     ssh_keepalive_interval: int = 30
+
+    # GPU preferences
+    preferred_gpu_names: list[str] = ["RTX 3090", "RTX 4090"]
 
     # Orchestrator scaling
     scale_up_waiting_threshold: int = 10

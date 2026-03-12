@@ -6,13 +6,14 @@ no shell scripts.  Pool changes trigger router_manager.reload() automatically.
 """
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 
 import aiohttp
 import structlog
+
+from shittytoken.common.prometheus import parse_prometheus_text
 
 logger = structlog.get_logger()
 
@@ -177,41 +178,9 @@ class WorkerRegistry:
                 if resp.status != 200:
                     return None
                 text = await resp.text()
-                metrics = _parse_prometheus_text(text)
+                metrics = parse_prometheus_text(text)
                 return metrics.get("num_requests_running")
         except Exception:  # noqa: BLE001 — intentional: errors during drain treated as unknown
             return None
 
 
-def _parse_prometheus_text(text: str) -> dict[str, float]:
-    """
-    Minimal Prometheus text-format parser.  stdlib only.
-
-    Skips comment lines (# ...) and blank lines.  Parses lines of the form:
-        metric_name [labels] value [timestamp]
-
-    Returns a dict mapping metric name (without labels) to float value.
-    Only the last occurrence of each name is retained.
-    """
-    result: dict[str, float] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Split on whitespace; we need at least name and value.
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        raw_name = parts[0]
-        raw_value = parts[1]
-        # Strip label block: metric_name{label="v"} → metric_name
-        brace_pos = raw_name.find("{")
-        name = raw_name[:brace_pos] if brace_pos != -1 else raw_name
-        try:
-            value = float(raw_value)
-        except ValueError:
-            # Completely non-numeric — skip.
-            continue
-        if math.isfinite(value):
-            result[name] = value
-    return result

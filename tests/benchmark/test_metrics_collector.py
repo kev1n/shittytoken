@@ -10,6 +10,7 @@ import aiohttp
 import aiohttp.test_utils
 import aiohttp.web
 
+from shittytoken.common.prometheus import parse_prometheus_text
 from shittytoken.benchmark.metrics_collector import MetricsCollector, MetricsScrape
 
 
@@ -58,7 +59,7 @@ _PROMETHEUS_TEXT_COMMENT_ONLY = """\
 
 
 def test_parse_extracts_all_five_metrics():
-    result = MetricsCollector.parse_prometheus_text(_VALID_PROMETHEUS_TEXT)
+    result = parse_prometheus_text(_VALID_PROMETHEUS_TEXT)
     assert result["vllm:prefix_cache_queries_total"] == 100.0
     assert result["vllm:prefix_cache_hits_total"] == 65.0
     assert result["vllm:gpu_cache_usage_perc"] == pytest.approx(0.42)
@@ -68,12 +69,12 @@ def test_parse_extracts_all_five_metrics():
 
 def test_parse_handles_comment_lines_without_error():
     # Should not raise; unknown metrics are simply ignored.
-    result = MetricsCollector.parse_prometheus_text(_PROMETHEUS_TEXT_COMMENT_ONLY)
+    result = parse_prometheus_text(_PROMETHEUS_TEXT_COMMENT_ONLY)
     assert result == {}
 
 
 def test_parse_handles_metrics_with_labels():
-    result = MetricsCollector.parse_prometheus_text(_PROMETHEUS_TEXT_WITH_LABELS)
+    result = parse_prometheus_text(_PROMETHEUS_TEXT_WITH_LABELS)
     assert result["vllm:prefix_cache_queries_total"] == 200.0
     assert result["vllm:prefix_cache_hits_total"] == 130.0
     assert result["vllm:gpu_cache_usage_perc"] == pytest.approx(0.55)

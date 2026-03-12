@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from shittytoken.common.prometheus import parse_prometheus_text
 from shittytoken.gateway.worker_registry import (
     CircuitBreakerState,
     WorkerEntry,
     WorkerRegistry,
-    _parse_prometheus_text,
 )
 
 # ---------------------------------------------------------------------------
@@ -201,42 +201,42 @@ class TestWorkerEntryDefaults:
 
 
 # ---------------------------------------------------------------------------
-# _parse_prometheus_text (internal helper — tested directly)
+# parse_prometheus_text (internal helper — tested directly)
 # ---------------------------------------------------------------------------
 
 
 class TestParsePrometheusText:
     def test_parses_simple_metric(self):
         text = "num_requests_running 3\n"
-        result = _parse_prometheus_text(text)
+        result = parse_prometheus_text(text)
         assert result["num_requests_running"] == 3.0
 
     def test_skips_comment_lines(self):
         text = "# HELP num_requests_running foo\nnum_requests_running 5\n"
-        result = _parse_prometheus_text(text)
+        result = parse_prometheus_text(text)
         assert result["num_requests_running"] == 5.0
         assert "# HELP num_requests_running foo" not in result
 
     def test_strips_label_block(self):
         text = 'vllm:gpu_cache_usage_perc{model_name="qwen"} 0.72\n'
-        result = _parse_prometheus_text(text)
+        result = parse_prometheus_text(text)
         assert "vllm:gpu_cache_usage_perc" in result
         assert result["vllm:gpu_cache_usage_perc"] == pytest.approx(0.72)
 
     def test_skips_blank_lines(self):
         text = "\n\nnum_requests_running 1\n\n"
-        result = _parse_prometheus_text(text)
+        result = parse_prometheus_text(text)
         assert result["num_requests_running"] == 1.0
 
     def test_empty_text_returns_empty_dict(self):
-        assert _parse_prometheus_text("") == {}
+        assert parse_prometheus_text("") == {}
 
     def test_last_occurrence_wins(self):
         text = "my_metric 1\nmy_metric 2\n"
-        result = _parse_prometheus_text(text)
+        result = parse_prometheus_text(text)
         assert result["my_metric"] == 2.0
 
     def test_non_numeric_value_skipped(self):
         text = "my_metric NaN\n"
-        result = _parse_prometheus_text(text)
+        result = parse_prometheus_text(text)
         assert "my_metric" not in result

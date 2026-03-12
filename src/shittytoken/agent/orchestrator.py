@@ -32,7 +32,7 @@ from ..knowledge.client import KnowledgeGraph
 from ..knowledge.schema import Configuration
 from .gateway import GatewayClient
 from .health import HeartbeatMonitor, wait_for_model_ready
-from .metrics import AggregateMetrics, aggregate_metrics
+from .metrics import AggregateMetrics, aggregate_metrics, scrape_worker_metrics
 from .provisioner import VastAIProvisioner, RunPodProvisioner, provision_instance
 from .ssh import SSHManager
 from .startup_monitor import StartupResult, monitor_startup
@@ -66,6 +66,7 @@ class Orchestrator:
         # instance_id → last known running-request count
         self._last_running: dict[str, int] = {}
 
+        self._provision_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
         self._session: Optional[aiohttp.ClientSession] = None
         self._ssh_manager: Optional[SSHManager] = None
@@ -137,6 +138,15 @@ class Orchestrator:
             avg_kv_cache=round(metrics.avg_kv_cache_usage, 3),
         )
 
+        # --- Scrape per-worker metrics for idle tracking ---
+        for sm in self._instances.values():
+            if sm.state == InstanceState.SERVING and sm.record.worker_url:
+                worker_metrics = await scrape_worker_metrics(
+                    sm.record.worker_url, self._session
+                )
+                running = int(worker_metrics.get("num_requests_running", 0))
+                self._last_running[sm.record.instance_id] = running
+
         # --- Update idle tracking per instance ---
         now = time.monotonic()
         for sm in self._instances.values():
@@ -154,16 +164,22 @@ class Orchestrator:
 
         # --- Scale up ---
         if metrics.total_requests_waiting > self._settings.scale_up_waiting_threshold:
-            logger.info(
-                "scale_up_triggered",
-                waiting=metrics.total_requests_waiting,
-                threshold=self._settings.scale_up_waiting_threshold,
-            )
-            asyncio.create_task(self.provision_and_qualify())
+            if not self._provision_lock.locked():
+                logger.info(
+                    "scale_up_triggered",
+                    waiting=metrics.total_requests_waiting,
+                    threshold=self._settings.scale_up_waiting_threshold,
+                )
+                asyncio.create_task(self._guarded_provision())
 
         # --- Scale down ---
         elif len(serving_urls) > 1:
             await self._maybe_scale_down(metrics)
+
+    async def _guarded_provision(self) -> None:
+        """Serialize provisioning so only one scale-up runs at a time."""
+        async with self._provision_lock:
+            await self.provision_and_qualify()
 
     async def _maybe_scale_down(self, metrics: AggregateMetrics) -> None:
         """Scale down if a worker has been idle long enough and KV cache is low."""
@@ -215,7 +231,7 @@ class Orchestrator:
         Returns InstanceRecord on success, None on any failure.
         """
         if gpu_names is None:
-            gpu_names = ["RTX 3090", "RTX 4090"]
+            gpu_names = self._settings.preferred_gpu_names
 
         settings = self._settings
 
@@ -239,7 +255,7 @@ class Orchestrator:
                 runpod=runpod,
                 config=config,
                 model_id=model_id,
-                hf_token="",   # HF token should come from settings; omitted per spec
+                hf_token=self._settings.huggingface_token,
                 gpu_names=gpu_names,
             )
         except (aiohttp.ClientError, TimeoutError) as exc:
@@ -276,10 +292,21 @@ class Orchestrator:
             return None
 
         # GPU verification uses first GPU name as expected model
+        expected_vram_gb = await self._kg.gpu_vram_for(gpu_names[0])
+        if expected_vram_gb is None:
+            logger.error(
+                "provision_gpu_vram_unknown",
+                gpu_name=gpu_names[0],
+            )
+            sm.transition(InstanceState.FAILED, reason="gpu_vram_unknown")
+            await self._ssh_manager.close(session)
+            await self._destroy_instance(record, sm)
+            return None
+
         gpu_ok = await self._ssh_manager.verify_gpu(
             session=session,
             expected_gpu_name=gpu_names[0],
-            expected_vram_gb=24,  # RTX 3090/4090 baseline VRAM
+            expected_vram_gb=expected_vram_gb,
         )
         if not gpu_ok:
             logger.error("provision_gpu_verify_failed", instance_id=record.instance_id)

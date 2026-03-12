@@ -73,6 +73,9 @@ class KnowledgeGraph:
             self._driver, gpu_model_name, llm_model_id
         )
 
+    async def gpu_vram_for(self, gpu_model_name: str) -> int | None:
+        return await queries.gpu_vram_for(self._driver, gpu_model_name)
+
     async def prior_oom_resolutions(
         self,
         gpu_model_name: str,

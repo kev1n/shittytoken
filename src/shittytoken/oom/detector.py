@@ -13,6 +13,10 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+import structlog
+
+logger = structlog.get_logger()
+
 
 class OOMType(str, Enum):
     LOADING = "loading"   # weights don't fit
@@ -56,53 +60,71 @@ def classify_oom(error_message: str, log_context: str = "") -> OOMClassification
     The log_context is the last N lines of container logs before the error.
     """
     combined = error_message + "\n" + log_context
+    classification: OOMClassification | None = None
 
     # Search error_message first (higher confidence)
     for pattern in RUNTIME_PATTERNS:
         m = pattern.search(error_message)
         if m:
-            return OOMClassification(
+            classification = OOMClassification(
                 oom_type=OOMType.RUNTIME,
                 confidence="high",
                 matched_pattern=pattern.pattern,
                 raw_error=error_message,
             )
+            break
 
-    for pattern in LOADING_PATTERNS:
-        m = pattern.search(error_message)
-        if m:
-            return OOMClassification(
-                oom_type=OOMType.LOADING,
-                confidence="high",
-                matched_pattern=pattern.pattern,
-                raw_error=error_message,
-            )
+    if classification is None:
+        for pattern in LOADING_PATTERNS:
+            m = pattern.search(error_message)
+            if m:
+                classification = OOMClassification(
+                    oom_type=OOMType.LOADING,
+                    confidence="high",
+                    matched_pattern=pattern.pattern,
+                    raw_error=error_message,
+                )
+                break
 
     # Fall back to log_context (medium confidence)
-    for pattern in RUNTIME_PATTERNS:
-        m = pattern.search(log_context)
-        if m:
-            return OOMClassification(
-                oom_type=OOMType.RUNTIME,
-                confidence="medium",
-                matched_pattern=pattern.pattern,
-                raw_error=error_message,
-            )
+    if classification is None:
+        for pattern in RUNTIME_PATTERNS:
+            m = pattern.search(log_context)
+            if m:
+                classification = OOMClassification(
+                    oom_type=OOMType.RUNTIME,
+                    confidence="medium",
+                    matched_pattern=pattern.pattern,
+                    raw_error=error_message,
+                )
+                break
 
-    for pattern in LOADING_PATTERNS:
-        m = pattern.search(log_context)
-        if m:
-            return OOMClassification(
-                oom_type=OOMType.LOADING,
-                confidence="medium",
-                matched_pattern=pattern.pattern,
-                raw_error=error_message,
-            )
+    if classification is None:
+        for pattern in LOADING_PATTERNS:
+            m = pattern.search(log_context)
+            if m:
+                classification = OOMClassification(
+                    oom_type=OOMType.LOADING,
+                    confidence="medium",
+                    matched_pattern=pattern.pattern,
+                    raw_error=error_message,
+                )
+                break
 
     # Ambiguous — default to LOADING (safer: avoids wrong KV-cache fix)
-    return OOMClassification(
-        oom_type=OOMType.LOADING,
-        confidence="low",
-        matched_pattern="<default>",
-        raw_error=error_message,
+    if classification is None:
+        classification = OOMClassification(
+            oom_type=OOMType.LOADING,
+            confidence="low",
+            matched_pattern="<default>",
+            raw_error=error_message,
+        )
+
+    logger.info(
+        "oom_classified",
+        oom_type=classification.oom_type.value,
+        confidence=classification.confidence,
+        matched_pattern=classification.matched_pattern,
     )
+
+    return classification

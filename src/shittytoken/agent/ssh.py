@@ -56,14 +56,17 @@ class SSHManager:
         Returns an SSHSession containing the live connection.
         Raises asyncssh.Error on connection failure.
         """
-        conn = await asyncssh.connect(
-            host=host,
-            port=port,
-            username=username,
-            client_keys=[self._private_key_path],
-            known_hosts=None,           # spot instances have ephemeral host keys
-            keepalive_interval=self._keepalive_interval,
-            keepalive_count_max=self._keepalive_count_max,
+        conn = await asyncio.wait_for(
+            asyncssh.connect(
+                host=host,
+                port=port,
+                username=username,
+                client_keys=[self._private_key_path],
+                known_hosts=None,           # spot instances have ephemeral host keys
+                keepalive_interval=self._keepalive_interval,
+                keepalive_count_max=self._keepalive_count_max,
+            ),
+            timeout=30.0,
         )
         session = SSHSession(host=host, port=port, _conn=conn)
         logger.info("ssh_connected", host=host, port=port, username=username)

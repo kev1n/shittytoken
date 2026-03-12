@@ -168,32 +168,40 @@ class OOMRecovery:
         # ------------------------------------------------------------------
         # STEP 5: build new Configuration by merging proposed fields
         # ------------------------------------------------------------------
-        new_config = Configuration(
-            tensor_parallel_size=proposed_config_dict.get(
-                "tensor_parallel_size", current_config.tensor_parallel_size
-            ),
-            max_model_len=proposed_config_dict.get(
-                "max_model_len", current_config.max_model_len
-            ),
-            gpu_memory_utilization=proposed_config_dict.get(
-                "gpu_memory_utilization", current_config.gpu_memory_utilization
-            ),
-            quantization=proposed_config_dict.get(
-                "quantization", current_config.quantization
-            ),
-            kv_cache_dtype=proposed_config_dict.get(
-                "kv_cache_dtype", current_config.kv_cache_dtype
-            ),
-            max_num_seqs=proposed_config_dict.get(
-                "max_num_seqs", current_config.max_num_seqs
-            ),
-            enable_prefix_caching=proposed_config_dict.get(
-                "enable_prefix_caching", current_config.enable_prefix_caching
-            ),
-            enforce_eager=proposed_config_dict.get(
-                "enforce_eager", current_config.enforce_eager
-            ),
-        )
+        try:
+            new_config = Configuration(
+                tensor_parallel_size=proposed_config_dict.get(
+                    "tensor_parallel_size", current_config.tensor_parallel_size
+                ),
+                max_model_len=proposed_config_dict.get(
+                    "max_model_len", current_config.max_model_len
+                ),
+                gpu_memory_utilization=proposed_config_dict.get(
+                    "gpu_memory_utilization", current_config.gpu_memory_utilization
+                ),
+                quantization=proposed_config_dict.get(
+                    "quantization", current_config.quantization
+                ),
+                kv_cache_dtype=proposed_config_dict.get(
+                    "kv_cache_dtype", current_config.kv_cache_dtype
+                ),
+                max_num_seqs=proposed_config_dict.get(
+                    "max_num_seqs", current_config.max_num_seqs
+                ),
+                enable_prefix_caching=proposed_config_dict.get(
+                    "enable_prefix_caching", current_config.enable_prefix_caching
+                ),
+                enforce_eager=proposed_config_dict.get(
+                    "enforce_eager", current_config.enforce_eager
+                ),
+            )
+        except ValueError as exc:
+            logger.warning("oom_proposed_config_invalid", error=str(exc), event_id=event_id)
+            try:
+                await self._kg.update_oom_outcome(event_id=event_id, succeeded=False, resolution_config_id=None)
+            except Exception as outcome_exc:
+                logger.error("update_oom_outcome_failed", error=str(outcome_exc))
+            return (False, None)
 
         # ------------------------------------------------------------------
         # STEP 6: persist the new configuration
@@ -225,10 +233,17 @@ class OOMRecovery:
                 event_id=event_id,
             )
         finally:
-            await self._kg.update_oom_outcome(
-                event_id=event_id,
-                succeeded=succeeded,
-                resolution_config_id=config_id if succeeded else None,
-            )
+            try:
+                await self._kg.update_oom_outcome(
+                    event_id=event_id,
+                    succeeded=succeeded,
+                    resolution_config_id=config_id if succeeded else None,
+                )
+            except Exception as outcome_exc:
+                logger.error(
+                    "update_oom_outcome_failed",
+                    event_id=event_id,
+                    error=str(outcome_exc),
+                )
 
         return (succeeded, new_config if succeeded else None)
