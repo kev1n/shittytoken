@@ -1,0 +1,12 @@
+plugin/
+guardian.db
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/

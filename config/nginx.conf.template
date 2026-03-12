@@ -1,0 +1,88 @@
+# nginx.conf.template — ShittyToken Gateway
+#
+# This file is a documentation/review reference showing the structure that
+# render_nginx_config() in gateway/nginx_config.py will produce.
+#
+# {router_port}   — TCP port where vLLM Router listens         (default: 8001)
+# {listen_port}   — TCP port nginx listens on                  (default: 80)
+# {read_timeout}  — proxy_read_timeout value in seconds        (default: 120)
+# {send_timeout}  — proxy_send_timeout value in seconds        (default: 120)
+#
+# This file is NOT executed directly.  Use write_nginx_config() to produce
+# the actual rendered configuration.
+
+worker_processes auto;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    upstream vllm_router {
+        server 127.0.0.1:{router_port};
+        keepalive 64;
+    }
+
+    log_format main '$remote_addr - $request_time $status "$request" '
+                    '$body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" '
+                    'req_id=$http_x_request_id';
+
+    access_log /var/log/nginx/access.log main;
+    error_log  /var/log/nginx/error.log warn;
+
+    # Never hold SSE chunks in nginx memory.
+    proxy_buffering off;
+
+    server {
+        listen {listen_port};
+
+        # ----------------------------------------------------------------
+        # SSE inference endpoint — full streaming directives
+        # ----------------------------------------------------------------
+        location /v1/chat/completions {
+            proxy_pass http://vllm_router;
+
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            # Belt-and-suspenders SSE: nginx layer + downstream layer.
+            proxy_buffering off;
+            add_header X-Accel-Buffering no;
+
+            proxy_read_timeout {read_timeout}s;
+            proxy_send_timeout {send_timeout}s;
+
+            # Forward client disconnects upstream so vLLM can cancel
+            # generation and free KV cache immediately.
+            proxy_ignore_client_abort off;
+        }
+
+        # ----------------------------------------------------------------
+        # Model listing — short timeout, no SSE directives needed
+        # ----------------------------------------------------------------
+        location /v1/models {
+            proxy_pass http://vllm_router;
+
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            proxy_read_timeout 30s;
+            proxy_send_timeout 30s;
+        }
+
+        # ----------------------------------------------------------------
+        # Health probe — answered locally, no upstream hop
+        # ----------------------------------------------------------------
+        location /health {
+            add_header Content-Type text/plain;
+            return 200 "ok\n";
+        }
+    }
+}
