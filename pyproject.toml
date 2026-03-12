@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shittytoken"
+version = "0.1.0"
+description = "Dirt-cheap LLM inference via autonomous spot GPU orchestration"
+requires-python = ">=3.11"
+dependencies = [
+    "neo4j[async]>=5.19",
+    "asyncssh>=2.14",
+    "anthropic>=0.25",
+    "aiohttp>=3.9",
+    "pydantic>=2.6",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "testcontainers[neo4j]>=4.0",
+    "aiohttp[speedups]>=3.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shittytoken"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.envs.default]
+features = ["dev"]
+
+[tool.hatch.envs.default.scripts]
+test = "pytest {args}"
