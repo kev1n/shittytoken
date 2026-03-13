@@ -35,8 +35,8 @@ from .health import HeartbeatMonitor, wait_for_model_ready
 from .metrics import AggregateMetrics, aggregate_metrics, scrape_worker_metrics
 from .provisioner import (
     DeploymentPlan,
-    VastAIProvisioner,
-    RunPodProvisioner,
+    GPUProvider,
+    VastAIProvider,
     build_deployment_plan,
     execute_deployment,
 )
@@ -257,9 +257,15 @@ class Orchestrator:
         settings = self._settings
 
         # Look up the best known configuration for the first GPU type
-        config_source = "knowledge_graph"
+        # Priority: benchmarked passing config > any seeded config > LLM proposal
+        config_source = "knowledge_graph_benchmarked"
         config = await self._kg.best_config_for(gpu_names[0], model_id)
         if config is None:
+            # Fallback: use any config linked to this GPU+model (e.g. seeded)
+            config = await self._kg.any_config_for(gpu_names[0], model_id)
+            config_source = "knowledge_graph_seed"
+        if config is None:
+            # Last resort: ask the LLM to propose a config
             logger.info(
                 "provision_no_config_proposing",
                 gpu_names=gpu_names,
@@ -277,14 +283,12 @@ class Orchestrator:
                 )
                 return None
 
-        vastai = VastAIProvisioner(settings.vastai_api_key, self._session)
-        runpod = RunPodProvisioner(settings.runpod_api_key, self._session)
+        provider = VastAIProvider(settings.vastai_api_key, self._session)
 
         # --- Step 1a: Build deployment plan (searches offers, no spend) ---
         try:
             plan = await build_deployment_plan(
-                vastai=vastai,
-                runpod=runpod,
+                provider=provider,
                 config=config,
                 model_id=model_id,
                 gpu_names=gpu_names,
@@ -305,8 +309,7 @@ class Orchestrator:
         try:
             provisioned = await execute_deployment(
                 plan=plan,
-                vastai=vastai,
-                runpod=runpod,
+                provider=provider,
                 hf_token=self._settings.huggingface_token,
             )
         except (aiohttp.ClientError, TimeoutError) as exc:
@@ -664,6 +667,10 @@ class Orchestrator:
         )
         return config
 
+    def _get_provider(self) -> GPUProvider:
+        """Return the GPU provider instance."""
+        return VastAIProvider(self._settings.vastai_api_key, self._session)
+
     async def _destroy_instance(
         self,
         record: InstanceRecord,
@@ -671,16 +678,8 @@ class Orchestrator:
     ) -> None:
         """Destroy the cloud instance and mark it TERMINATED (or FAILED)."""
         try:
-            if record.provider == "vastai":
-                vastai = VastAIProvisioner(
-                    self._settings.vastai_api_key, self._session
-                )
-                await vastai.destroy_instance(record.instance_id)
-            elif record.provider == "runpod":
-                runpod = RunPodProvisioner(
-                    self._settings.runpod_api_key, self._session
-                )
-                await runpod.destroy_instance(record.instance_id)
+            provider = self._get_provider()
+            await provider.destroy_instance(record.instance_id)
         except (aiohttp.ClientError, Exception) as exc:
             logger.error(
                 "destroy_instance_failed",

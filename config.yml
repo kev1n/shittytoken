@@ -30,6 +30,7 @@ gpus:
   preferred: ["RTX 3090", "RTX 4090"]
 
   # Minimum requirements for offer filtering
+  min_gpu_total_ram_gb: 48
   min_inet_up_mbps: 100.0
   min_pcie_bw_gbps: 5.0
   min_reliability: 0.99
@@ -41,7 +42,7 @@ gpus:
 vllm:
   defaults:
     tensor_parallel_size: 2
-    max_model_len: 8192
+    max_model_len: 200000
     gpu_memory_utilization: 0.90
     quantization: "awq"
     kv_cache_dtype: "auto"

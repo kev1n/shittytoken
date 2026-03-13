@@ -84,6 +84,64 @@ async def best_config_for(
     )
 
 
+async def any_config_for(
+    driver: "AsyncDriver",
+    gpu_model_name: str,
+    llm_model_id: str,
+) -> "Configuration | None":
+    """
+    Returns any Configuration linked to the GPU+model pair, regardless of
+    benchmark status. Used as a fallback when no benchmarked config exists
+    (e.g. first run with only seeded configs).
+    """
+    query = """
+        MATCH (g:GPUModel {name: $gpu_model_name})
+        MATCH (m:LLMModel {model_id: $llm_model_id})
+        MATCH (c:Configuration)-[:RUNS_ON]->(g)
+        MATCH (c)-[:SERVES]->(m)
+        RETURN c
+        ORDER BY c.created_at DESC
+        LIMIT 1
+    """
+    async with driver.session() as session:
+        result = await session.run(
+            query,
+            gpu_model_name=gpu_model_name,
+            llm_model_id=llm_model_id,
+        )
+        record = await result.single()
+
+    if record is None:
+        logger.info(
+            "any_config_for.no_result",
+            gpu_model_name=gpu_model_name,
+            llm_model_id=llm_model_id,
+        )
+        return None
+
+    from .schema import Configuration
+
+    node = record["c"]
+    props = dict(node)
+    logger.info(
+        "any_config_for.found",
+        config_id=props.get("config_id"),
+        note="unbenchmarked config — will be benchmarked after provisioning",
+    )
+    return Configuration(
+        config_id=props["config_id"],
+        tensor_parallel_size=props["tensor_parallel_size"],
+        max_model_len=props["max_model_len"],
+        gpu_memory_utilization=props["gpu_memory_utilization"],
+        quantization=props.get("quantization"),
+        kv_cache_dtype=props["kv_cache_dtype"],
+        max_num_seqs=props["max_num_seqs"],
+        enable_prefix_caching=props["enable_prefix_caching"],
+        enforce_eager=props["enforce_eager"],
+        created_at=props.get("created_at", datetime.now(tz=timezone.utc)),
+    )
+
+
 async def gpu_vram_for(driver: "AsyncDriver", gpu_model_name: str) -> int | None:
     """Return the VRAM (in GB) for a GPUModel, or None if not found."""
     query = "MATCH (g:GPUModel {name: $name}) RETURN g.vram_gb AS vram_gb"

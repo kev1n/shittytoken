@@ -73,6 +73,15 @@ class KnowledgeGraph:
             self._driver, gpu_model_name, llm_model_id
         )
 
+    async def any_config_for(
+        self,
+        gpu_model_name: str,
+        llm_model_id: str,
+    ) -> "Configuration | None":
+        return await queries.any_config_for(
+            self._driver, gpu_model_name, llm_model_id
+        )
+
     async def gpu_vram_for(self, gpu_model_name: str) -> int | None:
         return await queries.gpu_vram_for(self._driver, gpu_model_name)
 

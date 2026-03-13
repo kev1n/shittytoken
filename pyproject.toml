@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "structlog>=24.1",
     "pyyaml>=6.0",
+    "vastai-sdk>=0.5",
 ]
 
 [project.optional-dependencies]
