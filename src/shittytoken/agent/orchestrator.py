@@ -27,13 +27,19 @@ from typing import Optional
 import aiohttp
 import structlog
 
-from ..config import Settings
+from ..config import Settings, cfg, primary_model_id, preferred_gpus
 from ..knowledge.client import KnowledgeGraph
 from ..knowledge.schema import Configuration
 from .gateway import GatewayClient
 from .health import HeartbeatMonitor, wait_for_model_ready
 from .metrics import AggregateMetrics, aggregate_metrics, scrape_worker_metrics
-from .provisioner import VastAIProvisioner, RunPodProvisioner, provision_instance
+from .provisioner import (
+    DeploymentPlan,
+    VastAIProvisioner,
+    RunPodProvisioner,
+    build_deployment_plan,
+    execute_deployment,
+)
 from .ssh import SSHManager
 from .startup_monitor import StartupResult, monitor_startup
 from .state_machine import InstanceRecord, InstanceState, InstanceStateMachine
@@ -54,10 +60,16 @@ class Orchestrator:
         settings: Settings,
         kg: KnowledgeGraph,
         gateway: GatewayClient,
+        approval_fn=None,
     ) -> None:
         self._settings = settings
         self._kg = kg
         self._gateway = gateway
+        # Optional HITL callback: async fn(DeploymentPlan) -> bool
+        # When set, provision_and_qualify() presents the plan for approval
+        # before renting any GPU. If the callback returns False, provisioning
+        # is aborted. When None, all deployments are auto-approved.
+        self._approval_fn = approval_fn
 
         # instance_id → InstanceStateMachine
         self._instances: dict[str, InstanceStateMachine] = {}
@@ -82,11 +94,11 @@ class Orchestrator:
         self._session = aiohttp.ClientSession()
         self._ssh_manager = SSHManager(
             private_key_path=self._settings.ssh_private_key_path,
-            keepalive_interval=self._settings.ssh_keepalive_interval,
+            keepalive_interval=cfg["ssh"]["keepalive_interval"],
         )
         self._heartbeat_monitor = HeartbeatMonitor(
             session=self._session,
-            health_check_interval_s=self._settings.health_check_interval_s,
+            health_check_interval_s=cfg["orchestrator"]["health_check_interval_s"],
             on_failure=self._on_worker_failure,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor.run())
@@ -106,7 +118,7 @@ class Orchestrator:
                 try:
                     await asyncio.wait_for(
                         self._shutdown_event.wait(),
-                        timeout=self._settings.metrics_poll_interval_s,
+                        timeout=cfg["orchestrator"]["metrics_poll_interval_s"],
                     )
                 except asyncio.TimeoutError:
                     pass
@@ -125,8 +137,14 @@ class Orchestrator:
             if sm.state == InstanceState.SERVING and sm.record.worker_url
         ]
 
+        min_workers = cfg["orchestrator"].get("min_workers", 1)
+        provisioning = self._provision_lock.locked()
+
         if not serving_urls:
             logger.info("orchestrator_tick", serving_workers=0)
+            if not provisioning:
+                logger.info("min_workers_provision", min_workers=min_workers)
+                asyncio.create_task(self._guarded_provision())
             return
 
         metrics = await aggregate_metrics(serving_urls, self._session)
@@ -163,17 +181,18 @@ class Orchestrator:
                 self._idle_since.pop(iid, None)
 
         # --- Scale up ---
-        if metrics.total_requests_waiting > self._settings.scale_up_waiting_threshold:
+        _orch = cfg["orchestrator"]
+        if metrics.total_requests_waiting > _orch["scale_up_waiting_threshold"]:
             if not self._provision_lock.locked():
                 logger.info(
                     "scale_up_triggered",
                     waiting=metrics.total_requests_waiting,
-                    threshold=self._settings.scale_up_waiting_threshold,
+                    threshold=_orch["scale_up_waiting_threshold"],
                 )
                 asyncio.create_task(self._guarded_provision())
 
-        # --- Scale down ---
-        elif len(serving_urls) > 1:
+        # --- Scale down (never below min_workers) ---
+        elif len(serving_urls) > min_workers:
             await self._maybe_scale_down(metrics)
 
     async def _guarded_provision(self) -> None:
@@ -184,7 +203,7 @@ class Orchestrator:
     async def _maybe_scale_down(self, metrics: AggregateMetrics) -> None:
         """Scale down if a worker has been idle long enough and KV cache is low."""
         now = time.monotonic()
-        idle_threshold = self._settings.scale_down_idle_seconds
+        idle_threshold = cfg["orchestrator"]["scale_down_idle_seconds"]
 
         for sm in list(self._instances.values()):
             if sm.state != InstanceState.SERVING:
@@ -196,7 +215,7 @@ class Orchestrator:
             idle_secs = now - idle_start
             if (
                 idle_secs >= idle_threshold
-                and metrics.avg_kv_cache_usage < self._settings.scale_down_cache_max
+                and metrics.avg_kv_cache_usage < cfg["orchestrator"]["scale_down_cache_max"]
             ):
                 logger.info(
                     "scale_down_triggered",
@@ -214,7 +233,7 @@ class Orchestrator:
     async def provision_and_qualify(
         self,
         gpu_names: list[str] | None = None,
-        model_id: str = "Qwen/Qwen3.5-35B-A3B",
+        model_id: str | None = None,
     ) -> InstanceRecord | None:
         """
         Full provisioning + qualification flow.
@@ -230,33 +249,65 @@ class Orchestrator:
 
         Returns InstanceRecord on success, None on any failure.
         """
+        if model_id is None:
+            model_id = primary_model_id()
         if gpu_names is None:
-            gpu_names = self._settings.preferred_gpu_names
+            gpu_names = preferred_gpus()
 
         settings = self._settings
 
         # Look up the best known configuration for the first GPU type
+        config_source = "knowledge_graph"
         config = await self._kg.best_config_for(gpu_names[0], model_id)
         if config is None:
-            logger.warning(
-                "provision_no_config",
+            logger.info(
+                "provision_no_config_proposing",
                 gpu_names=gpu_names,
                 model_id=model_id,
             )
-            return None
+            config = await self._propose_and_store_config(
+                gpu_name=gpu_names[0], model_id=model_id
+            )
+            config_source = "llm_proposal"
+            if config is None:
+                logger.error(
+                    "provision_config_proposal_failed",
+                    gpu_names=gpu_names,
+                    model_id=model_id,
+                )
+                return None
 
         vastai = VastAIProvisioner(settings.vastai_api_key, self._session)
         runpod = RunPodProvisioner(settings.runpod_api_key, self._session)
 
-        # --- Step 1: Provision ---
+        # --- Step 1a: Build deployment plan (searches offers, no spend) ---
         try:
-            provisioned = await provision_instance(
+            plan = await build_deployment_plan(
                 vastai=vastai,
                 runpod=runpod,
                 config=config,
                 model_id=model_id,
-                hf_token=self._settings.huggingface_token,
                 gpu_names=gpu_names,
+                config_source=config_source,
+            )
+        except (aiohttp.ClientError, TimeoutError, RuntimeError) as exc:
+            logger.error("provision_plan_failed", error=str(exc))
+            return None
+
+        # --- Step 1b: HITL approval gate ---
+        if self._approval_fn is not None:
+            approved = await self._approval_fn(plan)
+            if not approved:
+                logger.info("provision_rejected_by_user", provider=plan.provider)
+                return None
+
+        # --- Step 1c: Execute the approved plan (rents the instance) ---
+        try:
+            provisioned = await execute_deployment(
+                plan=plan,
+                vastai=vastai,
+                runpod=runpod,
+                hf_token=self._settings.huggingface_token,
             )
         except (aiohttp.ClientError, TimeoutError) as exc:
             logger.error("provision_failed", error=str(exc))
@@ -336,7 +387,7 @@ class Orchestrator:
 
         startup_result, matched_line = await monitor_startup(
             line_generator=_line_gen(),
-            timeout_sec=settings.startup_monitor_timeout_s,
+            timeout_sec=cfg["orchestrator"]["startup_monitor_timeout_s"],
         )
         stream_task.cancel()
 
@@ -364,13 +415,14 @@ class Orchestrator:
             return None
 
         # --- Step 4: Wait for model ready via HTTP ---
-        worker_url = f"http://{record.ssh_host}:8000"
+        worker_port = cfg["vllm"]["worker_port"]
+        worker_url = f"http://{record.ssh_host}:{worker_port}"
         record.worker_url = worker_url
 
         model_ready = await wait_for_model_ready(
             base_url=worker_url,
             session=self._session,
-            timeout_sec=settings.startup_monitor_timeout_s,
+            timeout_sec=cfg["orchestrator"]["startup_monitor_timeout_s"],
         )
         if not model_ready:
             sm.transition(InstanceState.FAILED, reason="model_ready_timeout")
@@ -386,7 +438,16 @@ class Orchestrator:
                 worker_url=worker_url,
                 model_id=model_id,
                 gpu_model=record.gpu_model,
-                min_throughput_tps=settings.benchmark_min_throughput_tps,
+                raw_config={
+                    "tensor_parallel_size": config.tensor_parallel_size,
+                    "max_model_len": config.max_model_len,
+                    "gpu_memory_utilization": config.gpu_memory_utilization,
+                    "quantization": config.quantization,
+                    "kv_cache_dtype": config.kv_cache_dtype,
+                    "max_num_seqs": config.max_num_seqs,
+                    "enable_prefix_caching": config.enable_prefix_caching,
+                    "enforce_eager": config.enforce_eager,
+                },
             )
         except Exception as exc:  # noqa: BLE001 — benchmark errors are non-fatal
             logger.error(
@@ -545,6 +606,64 @@ class Orchestrator:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    async def _propose_and_store_config(
+        self,
+        gpu_name: str,
+        model_id: str,
+    ) -> Configuration | None:
+        """
+        Use the LLM to propose an initial config when no KG data exists.
+        Writes the proposed config to the KG and returns it.
+        Returns None if the proposal fails.
+        """
+        from .llm import propose_initial_config
+
+        gpu_vram = await self._kg.gpu_vram_for(gpu_name)
+        if gpu_vram is None:
+            logger.error("propose_config_gpu_vram_unknown", gpu_name=gpu_name)
+            return None
+
+        model_params = await self._kg.llm_model_params(model_id)
+        if model_params is None:
+            logger.error("propose_config_model_params_unknown", model_id=model_id)
+            return None
+
+        params_b, active_params_b = model_params
+
+        try:
+            proposed = await propose_initial_config(
+                gpu_model_name=gpu_name,
+                gpu_vram_gb=gpu_vram,
+                model_id=model_id,
+                params_b=params_b,
+                active_params_b=active_params_b,
+                kg=self._kg,
+                model=self._settings.agent_model,
+            )
+        except Exception as exc:
+            logger.error("propose_config_failed", error=str(exc))
+            return None
+
+        config = Configuration(
+            tensor_parallel_size=proposed.tensor_parallel_size,
+            max_model_len=proposed.max_model_len,
+            gpu_memory_utilization=proposed.gpu_memory_utilization,
+            quantization=proposed.quantization,
+            kv_cache_dtype=proposed.kv_cache_dtype,
+            max_num_seqs=proposed.max_num_seqs,
+            enable_prefix_caching=proposed.enable_prefix_caching,
+            enforce_eager=proposed.enforce_eager,
+        )
+        await self._kg.write_configuration(config)
+
+        logger.info(
+            "propose_config_stored",
+            config_id=config.config_id,
+            gpu_name=gpu_name,
+            model_id=model_id,
+        )
+        return config
+
     async def _destroy_instance(
         self,
         record: InstanceRecord,
@@ -598,13 +717,37 @@ class Orchestrator:
 # ---------------------------------------------------------------------------
 
 
+async def interactive_approval(plan: DeploymentPlan) -> bool:
+    """
+    Default HITL approval: prints the deployment plan and asks for confirmation.
+
+    Runs the blocking input() call in a thread executor so the event loop
+    stays alive.
+    """
+    print(plan.display())
+
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None, lambda: input("\n  Approve this deployment? [y/N] ").strip().lower()
+    )
+    approved = response in ("y", "yes")
+    if not approved:
+        print("  Deployment rejected.\n")
+    return approved
+
+
 async def main() -> None:
     """
     Process entry point.
 
     Reads settings from environment / .env, creates KnowledgeGraph and
     Orchestrator, runs the control loop.
+
+    HITL approval is enabled by default. Set SHITTYTOKEN_AUTO_APPROVE=1
+    to skip approval prompts.
     """
+    import os
+
     from ..log import configure_logging
     from ..gateway.router_manager import RouterManager
     from ..gateway.worker_registry import WorkerRegistry
@@ -622,11 +765,18 @@ async def main() -> None:
     )
     await kg.verify_connectivity()
 
-    router_manager = RouterManager()
+    router_manager = RouterManager(
+        static_models=[m["model_id"] for m in cfg["models"]["serving"]],
+    )
     registry = WorkerRegistry(router_manager=router_manager)
     gateway = GatewayClient(registry=registry)
 
-    orchestrator = Orchestrator(settings=settings, kg=kg, gateway=gateway)
+    auto_approve = os.getenv("SHITTYTOKEN_AUTO_APPROVE", "").strip() in ("1", "true")
+    approval_fn = None if auto_approve else interactive_approval
+
+    orchestrator = Orchestrator(
+        settings=settings, kg=kg, gateway=gateway, approval_fn=approval_fn
+    )
     await orchestrator.run()
 
 

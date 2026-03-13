@@ -95,6 +95,22 @@ async def gpu_vram_for(driver: "AsyncDriver", gpu_model_name: str) -> int | None
         return record["vram_gb"]
 
 
+async def llm_model_params(
+    driver: "AsyncDriver", model_id: str
+) -> tuple[float, float] | None:
+    """Return (params_b, active_params_b) for an LLMModel, or None if not found."""
+    query = """
+        MATCH (m:LLMModel {model_id: $model_id})
+        RETURN m.params_b AS params_b, m.active_params_b AS active_params_b
+    """
+    async with driver.session() as session:
+        result = await session.run(query, model_id=model_id)
+        record = await result.single()
+        if record is None:
+            return None
+        return (record["params_b"], record["active_params_b"])
+
+
 async def prior_oom_resolutions(
     driver: "AsyncDriver",
     gpu_model_name: str,

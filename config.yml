@@ -1,0 +1,105 @@
+# ShittyToken configuration
+# Secrets (API keys, passwords) stay in .env — this file is for tunable parameters.
+
+# ── Models ──────────────────────────────────────────────────────────────────
+models:
+  serving:
+    - model_id: "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit"
+      params_b: 35
+      active_params_b: 3
+      quantization: "awq"
+      dtype: "fp16"
+
+# ── GPUs ────────────────────────────────────────────────────────────────────
+gpus:
+  catalog:
+    - name: "RTX 3090"
+      vram_gb: 24
+      memory_bandwidth_gbs: 936
+    - name: "RTX 4090"
+      vram_gb: 24
+      memory_bandwidth_gbs: 1008
+    - name: "A100 SXM4 80GB"
+      vram_gb: 80
+      memory_bandwidth_gbs: 2000
+    - name: "H100 SXM5 80GB"
+      vram_gb: 80
+      memory_bandwidth_gbs: 3350
+
+  # GPUs to search for when provisioning spot instances
+  preferred: ["RTX 3090", "RTX 4090"]
+
+  # Minimum requirements for offer filtering
+  min_inet_up_mbps: 100.0
+  min_pcie_bw_gbps: 5.0
+  min_reliability: 0.99
+  min_gpus: 2
+
+# ── vLLM defaults ──────────────────────────────────────────────────────────
+# Initial configuration seeded into the knowledge graph per GPU.
+# The agent may propose different values via OOM recovery or LLM config proposal.
+vllm:
+  defaults:
+    tensor_parallel_size: 2
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+    quantization: "awq"
+    kv_cache_dtype: "auto"
+    max_num_seqs: 64
+    enable_prefix_caching: true
+    enforce_eager: false
+
+  worker_port: 8000
+
+# ── Gateway ─────────────────────────────────────────────────────────────────
+gateway:
+  router:
+    port: 8001
+    metrics_port: 29000
+    policy: "cache_aware"
+    engine_stats_interval: 10
+    config_path: "/tmp/shittytoken-router-config.json"
+    health_check_timeout_sec: 30.0
+
+  nginx:
+    listen_port: 80
+    read_timeout_sec: 120
+    send_timeout_sec: 120
+
+# ── Orchestrator ────────────────────────────────────────────────────────────
+orchestrator:
+  min_workers: 1
+  scale_up_waiting_threshold: 10
+  scale_down_idle_seconds: 300
+  scale_down_cache_max: 0.50
+  metrics_poll_interval_s: 10
+  health_check_interval_s: 30
+  startup_monitor_timeout_s: 600
+
+# ── SSH ─────────────────────────────────────────────────────────────────────
+ssh:
+  keepalive_interval: 30
+  vram_tolerance: 0.95
+
+# ── Benchmark ───────────────────────────────────────────────────────────────
+benchmark:
+  # Pass/fail thresholds
+  min_throughput_tps: 20.0
+  max_cold_cache_ttft_p95: 8.0
+  max_warm_cache_ttft_p95: 4.0
+  min_prefix_cache_hit_rate_phase3: 0.30
+  deltanet_cache_flag_threshold: 0.01
+  max_failed_request_rate: 0.02
+
+  # Shape
+  metrics_scrape_interval_sec: 2.0
+  warm_up_requests_per_prefix: 7
+  concurrency_levels: [1, 2, 4, 8, 16, 32, 64]
+
+  # Timeouts
+  request_timeout_sec: 120.0
+  first_token_timeout_sec: 30.0
+
+  # Virtual users
+  returning_user_fraction: 0.80
+  max_sessions: 200

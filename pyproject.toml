@@ -10,11 +10,12 @@ requires-python = ">=3.11"
 dependencies = [
     "neo4j[async]>=5.19",
     "asyncssh>=2.14",
-    "anthropic>=0.25",
+    "pydantic-ai-slim[anthropic]>=0.2",
     "aiohttp>=3.9",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "structlog>=24.1",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,9 @@ dev = [
     "testcontainers[neo4j]>=4.0",
     "aiohttp[speedups]>=3.9",
 ]
+
+[project.scripts]
+shittytoken = "shittytoken.__main__:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/shittytoken"]

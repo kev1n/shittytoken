@@ -22,7 +22,6 @@ Step order is:
 from __future__ import annotations
 
 import structlog
-import anthropic
 
 from ..knowledge.client import KnowledgeGraph
 from ..knowledge.schema import Configuration
@@ -44,11 +43,9 @@ class OOMRecovery:
     def __init__(
         self,
         kg: KnowledgeGraph,
-        anthropic_client: anthropic.AsyncAnthropic,
         model: str = "claude-opus-4-6",
     ) -> None:
         self._kg = kg
-        self._anthropic_client = anthropic_client
         self._model = model
 
     async def recover(
@@ -148,7 +145,7 @@ class OOMRecovery:
         try:
             proposed_config_dict = await reason_about_oom(
                 ctx=ctx,
-                anthropic_client=self._anthropic_client,
+                kg=self._kg,
                 model=self._model,
             )
         except OOMReasoningError as exc:

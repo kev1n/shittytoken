@@ -45,14 +45,6 @@ def _make_kg(
     return kg
 
 
-def _make_anthropic_client(proposed_config: dict | None = None) -> MagicMock:
-    """Returns a mock client whose reason_about_oom will return proposed_config."""
-    client = MagicMock()
-    # We patch reason_about_oom at the module level in tests, so the client
-    # itself just needs to be a valid object reference.
-    return client
-
-
 _VALID_PROPOSED = {
     "tensor_parallel_size": 1,
     "max_model_len": 4096,
@@ -108,9 +100,8 @@ async def test_write_oom_event_called_before_destroy_fn():
         return "inst-new"
 
     current_config = _make_config()
-    client = MagicMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     with patch(
         "shittytoken.oom.recovery.reason_about_oom",
@@ -139,9 +130,8 @@ async def test_successful_recovery_calls_update_oom_outcome_succeeded_true():
     """Successful provision → update_oom_outcome called with succeeded=True."""
     kg = _make_kg()
     current_config = _make_config()
-    client = MagicMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     with patch(
         "shittytoken.oom.recovery.reason_about_oom",
@@ -167,9 +157,8 @@ async def test_failed_recovery_provision_returns_none_calls_update_oom_outcome_f
     """provision_fn returns None → update_oom_outcome called with succeeded=False."""
     kg = _make_kg()
     current_config = _make_config()
-    client = MagicMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     with patch(
         "shittytoken.oom.recovery.reason_about_oom",
@@ -198,9 +187,8 @@ async def test_destroy_fn_raises_update_oom_outcome_still_called():
     """destroy_fn raises → update_oom_outcome is still called via try/finally."""
     kg = _make_kg()
     current_config = _make_config()
-    client = MagicMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     async def exploding_destroy(instance_id: str) -> None:
         raise RuntimeError("instance unreachable")
@@ -228,10 +216,9 @@ async def test_reasoning_error_calls_update_oom_outcome_false_no_destroy():
     """
     kg = _make_kg()
     current_config = _make_config()
-    client = MagicMock()
     destroy_fn = AsyncMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     with patch(
         "shittytoken.oom.recovery.reason_about_oom",
@@ -264,9 +251,8 @@ async def test_return_value_true_config_on_success():
     """recover() returns (True, Configuration) on successful provision."""
     kg = _make_kg()
     current_config = _make_config()
-    client = MagicMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     with patch(
         "shittytoken.oom.recovery.reason_about_oom",
@@ -288,9 +274,8 @@ async def test_return_value_false_none_on_failure():
     """recover() returns (False, None) when provision_fn returns None."""
     kg = _make_kg()
     current_config = _make_config()
-    client = MagicMock()
 
-    recovery = OOMRecovery(kg=kg, anthropic_client=client)
+    recovery = OOMRecovery(kg=kg)
 
     with patch(
         "shittytoken.oom.recovery.reason_about_oom",

@@ -1,3 +1,7 @@
+## Development
+
+- **Package manager:** Use `uv` for all Python dependency operations (install, sync, add, etc.). Do NOT use `pip` directly.
+
 <!-- BEGIN architecture-guardian rules -->
 ## Architecture Guardian Rules
 

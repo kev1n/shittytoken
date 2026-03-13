@@ -13,10 +13,11 @@ from dataclasses import dataclass, field
 import asyncssh
 import structlog
 
+from ..config import cfg
+
 logger = structlog.get_logger()
 
-# VRAM tolerance: GPU must report at least 95% of expected VRAM.
-_VRAM_TOLERANCE = 0.95
+_VRAM_TOLERANCE = cfg["ssh"]["vram_tolerance"]
 
 
 @dataclass

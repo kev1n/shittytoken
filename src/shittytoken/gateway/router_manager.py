@@ -1,83 +1,117 @@
 """
 RouterManager — lifecycle management for the vLLM Router (Rust binary).
 
-vLLM Router has no hot-add API.  Worker pool changes require a graceful
-restart: start a new process, verify its health, then terminate the old one.
+Install: uv pip install vllm-router
+Repo:    https://github.com/vllm-project/router
+
+Backend changes use --dynamic-config-json: the router polls a JSON config
+file every ~10 seconds and hot-reloads backends WITHOUT restarting the
+process. No connections are dropped during scaling events.
 
 Process management uses asyncio.create_subprocess_exec() exclusively —
 no shell=True, no subprocess.Popen.
 """
 
 import asyncio
+import json
 import time
-from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
 import structlog
 
+from ..config import cfg
+
 logger = structlog.get_logger()
 
 VLLM_ROUTER_BINARY = "vllm-router"
-VLLM_ROUTER_PORT = 8001
-VLLM_ROUTER_METRICS_PORT = 29000
-HEALTH_CHECK_TIMEOUT_SEC = 30.0
 
-# Placeholder URL used when the worker pool is empty at startup.
-# vLLM Router requires at least one backend in --static-backends.
-_EMPTY_POOL_PLACEHOLDER = "http://localhost:19999"
+# All config from config.yml
+_router_cfg = cfg["gateway"]["router"]
+VLLM_ROUTER_PORT = _router_cfg["port"]
+VLLM_ROUTER_METRICS_PORT = _router_cfg["metrics_port"]
+HEALTH_CHECK_TIMEOUT_SEC = _router_cfg["health_check_timeout_sec"]
+_DEFAULT_CONFIG_PATH = _router_cfg["config_path"]
 
 
 class RouterManager:
     """
     Manages the vLLM Router (Rust binary) process lifecycle.
 
-    Since vLLM Router has no hot-add API, adding/removing workers requires
-    a graceful restart.  reload() orchestrates: start new → verify health
-    → terminate old.
+    Worker pool changes are handled by rewriting the dynamic config JSON
+    file. The router polls this file and hot-reloads backends — no process
+    restart, no dropped connections.
     """
 
     def __init__(
         self,
-        policy: str = "cache_aware",
-        nginx_config_path: str = "/etc/nginx/nginx.conf",
+        policy: str | None = None,
+        static_models: list[str] | None = None,
+        config_path: str | None = None,
     ) -> None:
-        self._policy = policy
+        self._policy = policy or _router_cfg["policy"]
+        self._static_models = static_models or []
         self._worker_urls: list[str] = []
+        self._config_path = Path(config_path or _DEFAULT_CONFIG_PATH)
         self._process: asyncio.subprocess.Process | None = None
-        self._nginx_config_path = nginx_config_path
+
+    # ------------------------------------------------------------------
+    # Dynamic config file
+    # ------------------------------------------------------------------
+
+    def _write_config(self, worker_urls: list[str]) -> None:
+        """
+        Write the dynamic config JSON file that the router polls.
+
+        Format per vLLM Router docs:
+        https://docs.vllm.ai/projects/production-stack/en/latest/user_manual/router/json.html
+        """
+        config = {
+            "service_discovery": "static",
+            "routing_logic": self._policy,
+            "static_backends": ",".join(worker_urls) if worker_urls else "",
+        }
+        if self._static_models:
+            config["static_models"] = ",".join(self._static_models)
+
+        self._config_path.write_text(json.dumps(config, indent=2))
+        logger.info(
+            "router_config_written",
+            path=str(self._config_path),
+            worker_count=len(worker_urls),
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def build_startup_command(self, worker_urls: list[str]) -> list[str]:
+    def build_startup_command(self) -> list[str]:
         """
         Returns the argv list used to launch the vLLM Router binary.
 
-        If *worker_urls* is empty, a placeholder backend is injected so the
-        router process can start without any real workers registered yet.
+        Uses --dynamic-config-json so the router watches the config file
+        for backend changes without needing a restart.
         """
-        backends = worker_urls if worker_urls else [_EMPTY_POOL_PLACEHOLDER]
         return [
             VLLM_ROUTER_BINARY,
             "--port", str(VLLM_ROUTER_PORT),
-            "--service-discovery", "static",
-            "--static-backends", ",".join(backends),
-            "--routing-logic", self._policy,
-            "--metrics-port", str(VLLM_ROUTER_METRICS_PORT),
+            "--dynamic-config-json", str(self._config_path),
+            "--prometheus-port", str(VLLM_ROUTER_METRICS_PORT),
+            "--engine-stats-interval", str(_router_cfg["engine_stats_interval"]),
+            "--log-stats",
         ]
 
     async def start(self, worker_urls: list[str]) -> None:
         """
-        Launch the vLLM Router process and wait until its /health endpoint
-        returns 200.
+        Write the initial config file, launch the vLLM Router process,
+        and wait until its /health endpoint returns 200.
 
         Raises RuntimeError if the health check does not pass within
         HEALTH_CHECK_TIMEOUT_SEC.
         """
-        cmd = self.build_startup_command(worker_urls)
-        log = logger.bind(event="router_starting", cmd=cmd)
-        log.info("starting vllm-router")
+        self._write_config(worker_urls)
+        cmd = self.build_startup_command()
+        logger.info("router_starting", cmd=cmd)
 
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -100,51 +134,27 @@ class RouterManager:
 
     async def reload(self, worker_urls: list[str]) -> None:
         """
-        Graceful restart:
-        1. Launch a new process.
-        2. Wait for the new process's health check to pass.
-        3. Log the reload event.
-        4. Terminate the old process (SIGTERM; SIGKILL after 5 s if needed).
-        5. Update internal state.
+        Update the backend pool by rewriting the dynamic config file.
+
+        The router polls the file every ~10 seconds and hot-reloads.
+        No process restart. No dropped connections.
+
+        If the router process is not running, starts it.
         """
-        old_process = self._process
+        self._write_config(worker_urls)
+        self._worker_urls = list(worker_urls)
 
-        cmd = self.build_startup_command(worker_urls)
-        logger.info("router_reload_starting", cmd=cmd)
-
-        new_process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        # Temporarily store new process so is_healthy() probes the right port.
-        # (Both processes share the same port during the overlap window — the
-        # OS will route to whichever one owns the socket; in practice the new
-        # process binds after the old one releases it on SIGTERM, so we probe
-        # after a short readiness loop.)
-        self._process = new_process
-
-        if not await self._wait_for_health():
-            # New process failed — kill it and restore the old one.
-            new_process.terminate()
-            self._process = old_process
-            raise RuntimeError(
-                f"vLLM Router reload failed: new process did not become "
-                f"healthy within {HEALTH_CHECK_TIMEOUT_SEC}s"
-            )
+        if self._process is None or self._process.returncode is not None:
+            logger.warning("router_not_running_starting")
+            await self.start(worker_urls)
+            return
 
         logger.info(
-            "router_reloaded",
+            "router_config_updated",
             worker_count=len(worker_urls),
-            new_pid=new_process.pid,
+            pid=self._process.pid,
+            note="router will pick up changes within ~10s",
         )
-
-        # Gracefully terminate the old process.
-        if old_process is not None:
-            await self._terminate_process(old_process)
-
-        self._worker_urls = list(worker_urls)
 
     async def stop(self) -> None:
         """Terminate the router process gracefully."""
@@ -153,6 +163,11 @@ class RouterManager:
         logger.info("router_stopping", pid=self._process.pid)
         await self._terminate_process(self._process)
         self._process = None
+
+        # Clean up config file
+        if self._config_path.exists():
+            self._config_path.unlink()
+
         logger.info("router_stopped")
 
     async def is_healthy(self, session: aiohttp.ClientSession | None = None) -> bool:

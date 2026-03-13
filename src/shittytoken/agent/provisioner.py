@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import aiohttp
 import structlog
 
+from ..config import cfg
 from ..knowledge.schema import Configuration
 
 logger = structlog.get_logger()
@@ -107,9 +108,169 @@ class ProvisionedInstance:
     status: str
 
 
+@dataclass
+class DeploymentPlan:
+    """All details about a planned deployment, presented for human approval."""
+
+    # Config source
+    config_source: str  # "knowledge_graph" | "llm_proposal"
+
+    # vLLM configuration
+    tensor_parallel_size: int
+    max_model_len: int
+    gpu_memory_utilization: float
+    quantization: str | None
+    kv_cache_dtype: str
+    max_num_seqs: int
+    enable_prefix_caching: bool
+    enforce_eager: bool
+
+    # The full command that will be executed
+    vllm_command: str
+
+    # Provider & offer details
+    provider: str       # "vastai" | "runpod"
+    gpu_name: str
+    num_gpus: int
+    cost_per_hour_usd: float | None
+    reliability: float | None
+    offer_id: str
+
+    # Networking & interconnect
+    inet_up_mbps: float | None       # internet upload speed (MB/s)
+    inet_down_mbps: float | None     # internet download speed (MB/s)
+    inet_up_cost_per_gb: float | None   # $/GB upload
+    inet_down_cost_per_gb: float | None # $/GB download
+    pcie_bw_gbps: float | None       # PCIe bandwidth (GB/s)
+    bw_nvlink_gbps: float | None     # NVLink bandwidth (GB/s), None if no NVLink
+    dlperf: float | None             # Vast.ai DL performance score
+
+    # Model
+    model_id: str
+
+    def estimated_bandwidth_cost_per_mtok(self) -> float | None:
+        """
+        Rough estimate of bandwidth cost per million output tokens.
+
+        Assumes ~4 bytes per token streamed as SSE JSON (~20 bytes overhead).
+        Upload dominates (server → client = upload from the instance's perspective).
+        """
+        if self.inet_up_cost_per_gb is None:
+            return None
+        bytes_per_token = 24  # ~4 bytes token + SSE framing
+        gb_per_mtok = (bytes_per_token * 1_000_000) / (1024 ** 3)
+        return gb_per_mtok * self.inet_up_cost_per_gb
+
+    def display(self) -> str:
+        """Human-readable summary for approval."""
+        lines = [
+            "",
+            "=" * 64,
+            "  DEPLOYMENT PLAN",
+            "=" * 64,
+            "",
+            f"  Provider:       {self.provider}",
+            f"  Offer ID:       {self.offer_id}",
+            f"  GPU:            {self.num_gpus}× {self.gpu_name}",
+        ]
+        if self.cost_per_hour_usd is not None:
+            lines.append(f"  Compute cost:   ${self.cost_per_hour_usd:.4f}/hr")
+        if self.reliability is not None:
+            lines.append(f"  Reliability:    {self.reliability:.1%}")
+        if self.dlperf is not None:
+            lines.append(f"  DL perf score:  {self.dlperf:.1f}")
+
+        # Networking section
+        lines.append("")
+        lines.append("  Networking:")
+        if self.inet_up_mbps is not None:
+            lines.append(f"    Upload:       {self.inet_up_mbps:.0f} MB/s")
+        if self.inet_down_mbps is not None:
+            lines.append(f"    Download:     {self.inet_down_mbps:.0f} MB/s")
+        if self.inet_up_cost_per_gb is not None:
+            lines.append(f"    Upload cost:  ${self.inet_up_cost_per_gb:.4f}/GB")
+        if self.inet_down_cost_per_gb is not None:
+            lines.append(f"    Download cost: ${self.inet_down_cost_per_gb:.4f}/GB")
+        bw_cost = self.estimated_bandwidth_cost_per_mtok()
+        if bw_cost is not None:
+            lines.append(f"    Est. BW cost: ${bw_cost:.6f}/Mtok (upload)")
+
+        # Interconnect section
+        lines.append("")
+        lines.append("  Interconnect:")
+        if self.pcie_bw_gbps is not None:
+            lines.append(f"    PCIe BW:      {self.pcie_bw_gbps:.1f} GB/s")
+        if self.bw_nvlink_gbps is not None:
+            nvlink_str = f"{self.bw_nvlink_gbps:.1f} GB/s" if self.bw_nvlink_gbps > 0 else "none"
+            lines.append(f"    NVLink BW:    {nvlink_str}")
+        elif self.num_gpus > 1:
+            lines.append(f"    NVLink BW:    none (PCIe-only multi-GPU)")
+
+        lines += [
+            "",
+            f"  Model:          {self.model_id}",
+            "",
+            "  vLLM Configuration:",
+            f"    Config source:          {self.config_source}",
+            f"    tensor_parallel_size:   {self.tensor_parallel_size}",
+            f"    max_model_len:          {self.max_model_len}",
+            f"    gpu_memory_utilization: {self.gpu_memory_utilization}",
+            f"    quantization:           {self.quantization}",
+            f"    kv_cache_dtype:         {self.kv_cache_dtype}",
+            f"    max_num_seqs:           {self.max_num_seqs}",
+            f"    enable_prefix_caching:  {self.enable_prefix_caching}",
+            f"    enforce_eager:          {self.enforce_eager}",
+            "",
+            "  Command:",
+            f"    {self.vllm_command}",
+            "",
+            "=" * 64,
+        ]
+        return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Vast.ai provider
 # ---------------------------------------------------------------------------
+
+
+def _score_offer(offer: dict) -> float:
+    """
+    Composite score for ranking Vast.ai offers. Lower is better.
+
+    Components (all normalized to $/hr-equivalent scale):
+      1. Compute cost:   dph_total (dominant factor)
+      2. Bandwidth cost: inet_up_cost × estimated GB/hr of token output
+      3. Upload penalty:  penalize slow upload (tokens must reach clients)
+      4. NVLink bonus:    discount for NVLink (faster tensor parallelism)
+
+    For a bulk-inference platform, we want the cheapest instance that can
+    actually deliver tokens to clients without a network bottleneck.
+    """
+    cost = offer.get("dph_total", float("inf"))
+
+    # Estimated bandwidth cost per hour:
+    # At ~20 TPS peak, ~24 bytes/tok SSE, that's ~1.7 MB/hr = negligible.
+    # At scale (500 TPS), ~43 MB/hr ≈ 0.04 GB/hr.
+    # We use 0.1 GB/hr as a conservative estimate.
+    inet_up_cost = offer.get("inet_up_cost", 0) or 0
+    bw_cost_per_hr = inet_up_cost * 0.1  # $/hr from bandwidth
+
+    # Upload speed penalty: below 200 MB/s adds a penalty.
+    # A 100 MB/s link can still stream ~4000 concurrent 25-byte/tok streams,
+    # but we prefer faster links for burst handling.
+    inet_up = offer.get("inet_up", 0) or 0
+    upload_penalty = max(0, (200 - inet_up) / 200) * 0.05  # up to $0.05/hr penalty
+
+    # NVLink bonus: multi-GPU without NVLink is PCIe-bottlenecked for
+    # tensor parallelism. NVLink offers get a discount.
+    nvlink = offer.get("bw_nvlink", 0) or 0
+    num_gpus = offer.get("num_gpus", 1) or 1
+    nvlink_bonus = 0.0
+    if num_gpus > 1 and nvlink > 0:
+        nvlink_bonus = -0.03  # $0.03/hr discount for NVLink
+
+    return cost + bw_cost_per_hr + upload_penalty + nvlink_bonus
 
 
 class VastAIProvisioner:
@@ -125,23 +286,37 @@ class VastAIProvisioner:
     async def find_offers(
         self,
         gpu_names: list[str],
-        min_gpus: int = 2,
-        min_reliability: float = 0.99,
+        min_gpus: int | None = None,
+        min_reliability: float | None = None,
+        min_inet_up_mbps: float | None = None,
+        min_pcie_bw_gbps: float | None = None,
     ) -> list[dict]:
         """
-        POST /api/v0/bundles/ with filters.
+        POST /api/v0/bundles/ with filters for GPU, reliability, and network.
 
-        Returns a list of offers sorted by dph_total ascending (cheapest first).
+        Returns offers scored by a composite metric that balances cost,
+        network quality, and interconnect speed — not just cheapest.
         """
+        _gpu_cfg = cfg["gpus"]
+        if min_gpus is None:
+            min_gpus = _gpu_cfg["min_gpus"]
+        if min_reliability is None:
+            min_reliability = _gpu_cfg["min_reliability"]
+        if min_inet_up_mbps is None:
+            min_inet_up_mbps = _gpu_cfg["min_inet_up_mbps"]
+        if min_pcie_bw_gbps is None:
+            min_pcie_bw_gbps = _gpu_cfg["min_pcie_bw_gbps"]
+
         filters = {
             "verified": {"eq": True},
             "num_gpus": {"gte": min_gpus},
             "reliability2": {"gte": min_reliability},
             "rentable": {"eq": True},
             "gpu_name": {"in": gpu_names},
+            "inet_up": {"gte": min_inet_up_mbps},
+            "pcie_bw": {"gte": min_pcie_bw_gbps},
         }
         url = f"{_VASTAI_API_BASE}/bundles/"
-        params = {"q": str(filters)}
 
         async with self._session.post(
             url,
@@ -153,12 +328,19 @@ class VastAIProvisioner:
             data = await resp.json()
 
         offers = data.get("offers", [])
-        offers.sort(key=lambda o: o.get("dph_total", float("inf")))
+
+        # Score offers: lower is better. Composite of cost + bandwidth penalty.
+        # We want cheap instances with good upload speed and PCIe/NVLink.
+        for offer in offers:
+            offer["_score"] = _score_offer(offer)
+        offers.sort(key=lambda o: o["_score"])
+
         logger.info(
             "vastai_offers_found",
             gpu_names=gpu_names,
             min_gpus=min_gpus,
             count=len(offers),
+            top_score=round(offers[0]["_score"], 4) if offers else None,
         )
         return offers
 
@@ -428,6 +610,125 @@ class RunPodProvisioner:
 # ---------------------------------------------------------------------------
 
 
+async def build_deployment_plan(
+    vastai: VastAIProvisioner,
+    runpod: RunPodProvisioner,
+    config: Configuration,
+    model_id: str,
+    gpu_names: list[str],
+    config_source: str = "knowledge_graph",
+) -> DeploymentPlan:
+    """
+    Find the best offer and build a DeploymentPlan WITHOUT executing anything.
+
+    Tries Vast.ai first, falls back to RunPod. Raises if no offers from either.
+    """
+    vllm_command = build_vllm_command(config, model_id)
+
+    # --- Try Vast.ai ---
+    vastai_offer = None
+    try:
+        offers = await vastai.find_offers(
+            gpu_names=gpu_names, min_gpus=config.tensor_parallel_size
+        )
+        if offers:
+            vastai_offer = offers[0]
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        logger.warning("vastai_offer_search_failed", error=str(exc))
+
+    _config_fields = dict(
+        config_source=config_source,
+        tensor_parallel_size=config.tensor_parallel_size,
+        max_model_len=config.max_model_len,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        quantization=config.quantization,
+        kv_cache_dtype=config.kv_cache_dtype,
+        max_num_seqs=config.max_num_seqs,
+        enable_prefix_caching=config.enable_prefix_caching,
+        enforce_eager=config.enforce_eager,
+        vllm_command=vllm_command,
+        model_id=model_id,
+    )
+
+    if vastai_offer is not None:
+        return DeploymentPlan(
+            **_config_fields,
+            provider="vastai",
+            gpu_name=vastai_offer.get("gpu_name", gpu_names[0]),
+            num_gpus=int(vastai_offer.get("num_gpus", config.tensor_parallel_size)),
+            cost_per_hour_usd=vastai_offer.get("dph_total"),
+            reliability=vastai_offer.get("reliability2"),
+            offer_id=str(vastai_offer["id"]),
+            inet_up_mbps=vastai_offer.get("inet_up"),
+            inet_down_mbps=vastai_offer.get("inet_down"),
+            inet_up_cost_per_gb=vastai_offer.get("inet_up_cost"),
+            inet_down_cost_per_gb=vastai_offer.get("inet_down_cost"),
+            pcie_bw_gbps=vastai_offer.get("pcie_bw"),
+            bw_nvlink_gbps=vastai_offer.get("bw_nvlink"),
+            dlperf=vastai_offer.get("dlperf"),
+        )
+
+    # --- Fall back to RunPod ---
+    logger.info("vastai_no_offers", gpu_names=gpu_names, falling_back_to="runpod")
+    runpod_offers = await runpod.find_offers(gpu_types=gpu_names)
+    if not runpod_offers:
+        raise RuntimeError(
+            f"No GPU offers found on Vast.ai or RunPod for {gpu_names}"
+        )
+
+    best_runpod = runpod_offers[0]
+    lowest = best_runpod.get("lowestPrice") or {}
+    return DeploymentPlan(
+        **_config_fields,
+        provider="runpod",
+        gpu_name=best_runpod.get("displayName", gpu_names[0]),
+        num_gpus=config.tensor_parallel_size,
+        cost_per_hour_usd=lowest.get("uninterruptablePrice"),
+        reliability=None,
+        offer_id=best_runpod.get("id", ""),
+        # RunPod doesn't expose these granular network metrics
+        inet_up_mbps=None,
+        inet_down_mbps=None,
+        inet_up_cost_per_gb=None,
+        inet_down_cost_per_gb=None,
+        pcie_bw_gbps=None,
+        bw_nvlink_gbps=None,
+        dlperf=None,
+    )
+
+
+async def execute_deployment(
+    plan: DeploymentPlan,
+    vastai: VastAIProvisioner,
+    runpod: RunPodProvisioner,
+    hf_token: str,
+) -> ProvisionedInstance:
+    """
+    Execute a previously approved DeploymentPlan.
+    Rents the instance on the chosen provider and waits for SSH readiness.
+    """
+    if plan.provider == "vastai":
+        instance = await vastai.create_instance(
+            offer_id=plan.offer_id,
+            vllm_command=plan.vllm_command,
+            hf_token=hf_token,
+        )
+    else:
+        instance = await runpod.create_instance(
+            gpu_type=plan.offer_id,
+            vllm_command=plan.vllm_command,
+            hf_token=hf_token,
+        )
+
+    logger.info(
+        "instance_provisioned",
+        provider=plan.provider,
+        gpu_model=instance.gpu_model,
+        instance_id=instance.instance_id,
+    )
+    return instance
+
+
 async def provision_instance(
     vastai: VastAIProvisioner,
     runpod: RunPodProvisioner,
@@ -435,52 +736,20 @@ async def provision_instance(
     model_id: str,
     hf_token: str,
     gpu_names: list[str],
+    config_source: str = "knowledge_graph",
 ) -> ProvisionedInstance:
     """
-    Build the vllm command from *config*, then try Vast.ai first.
-    Falls back to RunPod if Vast.ai has no matching offers or creation fails.
+    Build + execute provisioning in one step (no HITL).
 
-    Logs {"event": "instance_provisioned", "provider": ..., "gpu_model": ...}
-    on success.
+    Kept for backward compatibility. The orchestrator uses
+    build_deployment_plan() + execute_deployment() with approval in between.
     """
-    vllm_command = build_vllm_command(config, model_id)
-
-    # --- Try Vast.ai ---
-    try:
-        offers = await vastai.find_offers(gpu_names=gpu_names, min_gpus=config.tensor_parallel_size)
-        if offers:
-            best_offer = offers[0]
-            instance = await vastai.create_instance(
-                offer_id=str(best_offer["id"]),
-                vllm_command=vllm_command,
-                hf_token=hf_token,
-            )
-            logger.info(
-                "instance_provisioned",
-                provider="vastai",
-                gpu_model=instance.gpu_model,
-                instance_id=instance.instance_id,
-            )
-            return instance
-        logger.info("vastai_no_offers", gpu_names=gpu_names, falling_back_to="runpod")
-    except (aiohttp.ClientError, TimeoutError) as exc:
-        logger.warning(
-            "vastai_provision_failed",
-            error=str(exc),
-            falling_back_to="runpod",
-        )
-
-    # --- Fall back to RunPod ---
-    gpu_type = gpu_names[0] if gpu_names else "NVIDIA GeForce RTX 4090"
-    instance = await runpod.create_instance(
-        gpu_type=gpu_type,
-        vllm_command=vllm_command,
-        hf_token=hf_token,
+    plan = await build_deployment_plan(
+        vastai=vastai,
+        runpod=runpod,
+        config=config,
+        model_id=model_id,
+        gpu_names=gpu_names,
+        config_source=config_source,
     )
-    logger.info(
-        "instance_provisioned",
-        provider="runpod",
-        gpu_model=instance.gpu_model,
-        instance_id=instance.instance_id,
-    )
-    return instance
+    return await execute_deployment(plan, vastai, runpod, hf_token)

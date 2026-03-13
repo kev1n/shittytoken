@@ -76,6 +76,9 @@ class KnowledgeGraph:
     async def gpu_vram_for(self, gpu_model_name: str) -> int | None:
         return await queries.gpu_vram_for(self._driver, gpu_model_name)
 
+    async def llm_model_params(self, model_id: str) -> tuple[float, float] | None:
+        return await queries.llm_model_params(self._driver, model_id)
+
     async def prior_oom_resolutions(
         self,
         gpu_model_name: str,
