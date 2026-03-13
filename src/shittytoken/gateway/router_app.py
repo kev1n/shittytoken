@@ -1,3 +1,11 @@
+"""
+Application factory for the custom aiohttp router.
+
+Wires together: worker pool, routing policy, proxy, admin API,
+auth middleware (Redis-backed), and the billing pipeline
+(Redis hot-path + Postgres ledger + usage event consumer).
+"""
+
 import asyncio
 import os
 
@@ -13,14 +21,12 @@ from .admin_api import add_worker, remove_worker, list_workers
 from .prom_metrics import handle_metrics
 from .middleware import request_id_middleware
 from .auth import auth_middleware
-from .billing_db import BillingDB
-from .billing import BillingManager
 
 logger = structlog.get_logger()
 
-# Billing config defaults
-_billing_cfg = cfg.get("gateway", {}).get("billing", {})
-_auth_cfg = cfg.get("gateway", {}).get("auth", {})
+_gateway_cfg = cfg.get("gateway", {})
+_billing_cfg = _gateway_cfg.get("billing", {})
+_auth_cfg = _gateway_cfg.get("auth", {})
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -30,15 +36,11 @@ async def handle_health(request: web.Request) -> web.Response:
 async def create_router_app(
     admin_token: str | None = None,
 ) -> web.Application:
-    """
-    Create the custom router aiohttp application.
-
-    Mounts routes, initialises billing DB, and wires auth + billing middleware.
-    """
+    """Create the custom router aiohttp application."""
     middlewares = [request_id_middleware, auth_middleware]
     app = web.Application(middlewares=middlewares)
 
-    # ── Shared state ──────────────────────────────────────────────────
+    # ── Core routing state ────────────────────────────────────────────
     policy = CacheAwarePolicy()
     pool = WorkerPool(policy=policy)
     app["worker_pool"] = pool
@@ -46,46 +48,68 @@ async def create_router_app(
     app["admin_token"] = admin_token
     app["auth_enabled"] = _auth_cfg.get("enabled", False)
 
-    # ── Billing DB ────────────────────────────────────────────────────
-    db_path = _billing_cfg.get("db_path", "data/billing.db")
-    billing_db = BillingDB(db_path)
-    app["billing_db"] = billing_db
-
-    # ── Billing Manager ───────────────────────────────────────────────
-    pricing = _billing_cfg.get("pricing", {})
-    stripe_sync = _billing_cfg.get("stripe_sync_enabled", False)
-    billing_mgr = BillingManager(
-        db=billing_db,
-        pricing=pricing,
-        stripe_sync_enabled=stripe_sync,
-    )
-    app["billing_manager"] = billing_mgr
-
     # ── Lifecycle hooks ───────────────────────────────────────────────
     async def on_startup(app: web.Application) -> None:
-        # Ensure data directory exists for SQLite
-        db_dir = os.path.dirname(db_path)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        await billing_db.init()
-
+        # Upstream HTTP session for proxying to vLLM workers
         connector = aiohttp.TCPConnector(limit=256)
-        session = aiohttp.ClientSession(connector=connector)
-        app["upstream_session"] = session
+        app["upstream_session"] = aiohttp.ClientSession(connector=connector)
+
+        # Background worker metrics scraper
         app["_scraper_task"] = asyncio.ensure_future(pool.run_scraper())
-        app["_flush_task"] = asyncio.ensure_future(
-            billing_mgr.run_flush_loop(
-                interval_sec=_billing_cfg.get("flush_interval_s", 1.0),
+
+        # ── Billing infrastructure (only if auth enabled) ────────────
+        if app["auth_enabled"]:
+            from shittytoken.billing.postgres import BillingPostgres
+            from shittytoken.billing.redis_cache import BillingRedis
+            from shittytoken.billing.usage_pipeline import (
+                BillingPipeline,
+                InProcessConsumer,
+                InProcessPublisher,
             )
-        )
-        if stripe_sync:
-            app["_stripe_sync_task"] = asyncio.ensure_future(
-                billing_mgr.run_stripe_sync()
+            from shittytoken.billing.reconciler import Reconciler
+
+            pg_dsn = _billing_cfg.get("postgres_dsn", "postgresql://localhost/shittytoken")
+            redis_url = _billing_cfg.get("redis_url", "redis://localhost:6379/0")
+            pricing = _billing_cfg.get("pricing", {})
+
+            billing_pg = await BillingPostgres.create(pg_dsn)
+            billing_redis = await BillingRedis.create(redis_url)
+
+            app["billing_postgres"] = billing_pg
+            app["billing_redis"] = billing_redis
+
+            # Usage pipeline (in-process queue; swap for Kafka when ready)
+            publisher = InProcessPublisher()
+            consumer = InProcessConsumer(publisher)
+            pipeline = BillingPipeline(
+                publisher=publisher,
+                consumer=consumer,
+                postgres=billing_pg,
+                redis=billing_redis,
+                pricing=pricing,
             )
+            app["billing_pipeline"] = pipeline
+
+            # Background tasks
+            app["_consumer_task"] = asyncio.ensure_future(pipeline.run_consumer())
+            reconciler = Reconciler(
+                postgres=billing_pg,
+                redis=billing_redis,
+                interval_sec=_billing_cfg.get("reconcile_interval_s", 60.0),
+            )
+            app["_reconciler_task"] = asyncio.ensure_future(reconciler.run())
+
+            logger.info("billing_started", pg_dsn=pg_dsn, redis_url=redis_url)
+        else:
+            logger.info("billing_disabled")
+
         logger.info("router_app_started", auth_enabled=app["auth_enabled"])
 
     async def on_cleanup(app: web.Application) -> None:
-        for task_key in ("_scraper_task", "_flush_task", "_stripe_sync_task"):
+        # Cancel background tasks
+        for task_key in (
+            "_scraper_task", "_consumer_task", "_reconciler_task",
+        ):
             task = app.get(task_key)
             if task is not None:
                 task.cancel()
@@ -93,8 +117,20 @@ async def create_router_app(
                     await task
                 except asyncio.CancelledError:
                     pass
+
         await app["upstream_session"].close()
-        await billing_db.close()
+
+        # Cleanup billing resources
+        pipeline = app.get("billing_pipeline")
+        if pipeline is not None:
+            await pipeline.close()
+        billing_pg = app.get("billing_postgres")
+        if billing_pg is not None:
+            await billing_pg.close()
+        billing_redis = app.get("billing_redis")
+        if billing_redis is not None:
+            await billing_redis.close()
+
         logger.info("router_app_stopped")
 
     app.on_startup.append(on_startup)

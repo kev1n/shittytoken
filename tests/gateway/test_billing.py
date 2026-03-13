@@ -1,149 +1,136 @@
-"""Tests for the billing subsystem: billing_db, auth middleware, and BillingManager."""
+"""Tests for the billing subsystem: models, pipeline, auth middleware, cost computation."""
 
 from __future__ import annotations
 
 import hashlib
+import math
 
 import pytest
 from aiohttp import web
 
-from shittytoken.gateway.auth import auth_middleware, _key_cache, _balance_cache
-from shittytoken.gateway.billing import BillingManager
-from shittytoken.gateway.billing_db import BillingDB
+from shittytoken.billing.models import UsageEvent, CreditBlock, LedgerEvent
+from shittytoken.billing.usage_pipeline import BillingPipeline
 
 
 # ======================================================================
-# Fixtures
+# 1. Model tests
 # ======================================================================
 
 
-@pytest.fixture
-async def db(tmp_path):
-    db = BillingDB(str(tmp_path / "test.db"))
-    await db.init()
-    yield db
-    await db.close()
+class TestUsageEvent:
+    def test_to_dict_roundtrip(self):
+        event = UsageEvent(
+            event_id="evt-1",
+            user_id="u1",
+            api_key_hash="abc",
+            model="test-model",
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cost_cents=1,
+            latency_ms=200,
+            request_id="req-1",
+            created_at="2026-01-01T00:00:00Z",
+        )
+        d = event.to_dict()
+        assert d["event_id"] == "evt-1"
+        assert d["total_tokens"] == 150
+        assert d["cost_cents"] == 1
+
+        # Reconstruct from dict
+        event2 = UsageEvent(**d)
+        assert event2.event_id == event.event_id
+        assert event2.total_tokens == event.total_tokens
 
 
 # ======================================================================
-# 1. BillingDB tests
+# 2. Cost computation tests
 # ======================================================================
 
 
-class TestBillingDB:
-    async def test_create_user_and_lookup(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com", stripe_customer_id="cus_123")
-        key_hash = hashlib.sha256(b"sk-test-123").hexdigest()
-        await db.create_api_key(key_hash, "u1", name="test-key")
+class TestCostComputation:
+    def test_default_pricing(self):
+        # Default is 100 cents per 1M tokens.
+        # 1000 tokens => ceil(1000 * 100 / 1_000_000) = ceil(0.1) = 1 cent.
+        cost = BillingPipeline.compute_cost("some-model", 500, 500)
+        assert cost == 1
 
-        result = await db.lookup_api_key(key_hash)
-        assert result is not None
-        assert result["key_hash"] == key_hash
-        assert result["user_id"] == "u1"
-        assert result["name"] == "test-key"
-        assert result["rate_limit_rpm"] == 60
-        assert result["rate_limit_tpm"] == 100_000
-        assert result["is_active"] == 1
+    def test_custom_pricing(self):
+        pricing = {"test": 500.0}
+        # 10000 tokens at 500 cents/1M => ceil(10000 * 500 / 1_000_000) = 5 cents.
+        cost = BillingPipeline.compute_cost("test", 5000, 5000, pricing)
+        assert cost == 5
 
-    async def test_lookup_nonexistent_key(self, db: BillingDB):
-        result = await db.lookup_api_key("nonexistent_hash")
-        assert result is None
+    def test_minimum_1_cent(self):
+        # Even 1 token => max(ceil(1 * 100 / 1_000_000), 1) = 1 cent.
+        cost = BillingPipeline.compute_cost("any-model", 1, 0)
+        assert cost == 1
 
-    async def test_set_and_get_balance(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
-        await db.set_balance("u1", 500)
-        balance = await db.get_balance("u1")
-        assert balance == 500
+    def test_large_request(self):
+        # 1M tokens at $1/1M = 100 cents.
+        cost = BillingPipeline.compute_cost("model", 500_000, 500_000)
+        assert cost == 100
 
-    async def test_deduct_balance(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
-        await db.set_balance("u1", 1000)
-        new_balance = await db.deduct_balance("u1", 300)
-        assert new_balance == 700
-        assert await db.get_balance("u1") == 700
-
-    async def test_deduct_balance_no_row(self, db: BillingDB):
-        with pytest.raises(ValueError, match="No balance row"):
-            await db.deduct_balance("unknown_user", 100)
-
-    async def test_record_usage_and_batch(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
-        await db.set_balance("u1", 1000)
-
-        events = [
-            {
-                "event_id": "evt-1",
-                "api_key_hash": "keyhash1",
-                "user_id": "u1",
-                "model": "gpt-4",
-                "prompt_tokens": 100,
-                "completion_tokens": 50,
-                "total_tokens": 150,
-                "latency_ms": 200,
-                "cost_cents": 10,
-            },
-            {
-                "event_id": "evt-2",
-                "api_key_hash": "keyhash1",
-                "user_id": "u1",
-                "model": "gpt-4",
-                "prompt_tokens": 200,
-                "completion_tokens": 100,
-                "total_tokens": 300,
-                "latency_ms": 300,
-                "cost_cents": 20,
-            },
-        ]
-        await db.batch_record_usage(events)
-
-        # Balance should be deducted by sum of costs (10 + 20 = 30).
-        assert await db.get_balance("u1") == 970
-
-        # Events should appear as unsynced.
-        unsynced = await db.get_unsynced_events()
-        event_ids = {e["event_id"] for e in unsynced}
-        assert "evt-1" in event_ids
-        assert "evt-2" in event_ids
-
-    async def test_mark_synced(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
-        await db.set_balance("u1", 1000)
-
-        events = [
-            {
-                "event_id": "evt-1",
-                "api_key_hash": "keyhash1",
-                "user_id": "u1",
-                "model": "gpt-4",
-                "prompt_tokens": 100,
-                "completion_tokens": 50,
-                "total_tokens": 150,
-                "latency_ms": 200,
-                "cost_cents": 10,
-            },
-        ]
-        await db.batch_record_usage(events)
-
-        await db.mark_synced(["evt-1"])
-        unsynced = await db.get_unsynced_events()
-        assert len(unsynced) == 0
-
-    async def test_set_balance_upsert(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
-        await db.set_balance("u1", 500)
-        assert await db.get_balance("u1") == 500
-
-        await db.set_balance("u1", 999)
-        assert await db.get_balance("u1") == 999
+    def test_zero_tokens_still_1_cent(self):
+        # Edge case: 0 tokens should still be minimum 1 cent.
+        cost = BillingPipeline.compute_cost("model", 0, 0)
+        assert cost == 1
 
 
 # ======================================================================
-# 2. Auth middleware tests
+# 3. Auth middleware tests (with mocked Redis/Postgres)
 # ======================================================================
+
+
+class FakeBillingRedis:
+    """Minimal fake for testing auth middleware without real Redis."""
+
+    def __init__(self):
+        self._balances: dict[str, int] = {}
+        self._api_keys: dict[str, dict] = {}
+        self._rpm_counts: dict[str, int] = {}
+
+    async def get_cached_api_key(self, key_hash: str) -> dict | None:
+        return self._api_keys.get(key_hash)
+
+    async def cache_api_key(self, key_hash: str, key_data: dict, ttl: int = 300) -> None:
+        self._api_keys[key_hash] = key_data
+
+    async def get_balance(self, user_id: str) -> int:
+        return self._balances.get(user_id, 0)
+
+    async def check_rate_limit_rpm(self, key_hash: str, limit: int) -> bool:
+        count = self._rpm_counts.get(key_hash, 0)
+        return count < limit
+
+    async def check_rate_limit_tpm(self, key_hash: str, limit: int, estimated_tokens: int = 0) -> bool:
+        return True
+
+    async def record_request(self, key_hash: str) -> None:
+        self._rpm_counts[key_hash] = self._rpm_counts.get(key_hash, 0) + 1
+
+
+class FakeBillingPostgres:
+    """Minimal fake for testing auth middleware Postgres fallback."""
+
+    def __init__(self):
+        self._api_keys: dict[str, object] = {}
+
+    async def lookup_api_key(self, key_hash: str):
+        return self._api_keys.get(key_hash)
+
+
+class FakeApiKey:
+    def __init__(self, user_id, is_active=True, rpm=60, tpm=100_000):
+        self.key_hash = ""
+        self.user_id = user_id
+        self.name = "test"
+        self.rate_limit_rpm = rpm
+        self.rate_limit_tpm = tpm
+        self.is_active = is_active
 
 
 async def _test_handler(request: web.Request) -> web.Response:
-    """Simple handler that returns the user_id set by auth middleware."""
     user_id = request.get("user_id", "anonymous")
     return web.Response(text=user_id)
 
@@ -153,9 +140,22 @@ async def _health_handler(request: web.Request) -> web.Response:
 
 
 @pytest.fixture
-async def app(db):
+def fake_redis():
+    return FakeBillingRedis()
+
+
+@pytest.fixture
+def fake_pg():
+    return FakeBillingPostgres()
+
+
+@pytest.fixture
+async def app(fake_redis, fake_pg):
+    from shittytoken.gateway.auth import auth_middleware
+
     app = web.Application(middlewares=[auth_middleware])
-    app["billing_db"] = db
+    app["billing_redis"] = fake_redis
+    app["billing_postgres"] = fake_pg
     app["auth_enabled"] = True
     app.router.add_post("/v1/chat/completions", _test_handler)
     app.router.add_get("/health", _health_handler)
@@ -165,16 +165,6 @@ async def app(db):
 @pytest.fixture
 async def client(app, aiohttp_client):
     return await aiohttp_client(app)
-
-
-@pytest.fixture(autouse=True)
-def _clear_auth_caches():
-    """Clear module-level caches between tests to avoid cross-test pollution."""
-    _key_cache._store.clear()
-    _balance_cache._store.clear()
-    yield
-    _key_cache._store.clear()
-    _balance_cache._store.clear()
 
 
 class TestAuthMiddleware:
@@ -196,31 +186,33 @@ class TestAuthMiddleware:
     async def test_unknown_api_key(self, client):
         resp = await client.post(
             "/v1/chat/completions",
-            headers={"Authorization": "Bearer unknown-key-value"},
+            headers={"Authorization": "Bearer unknown-key"},
         )
         assert resp.status == 401
 
-    async def test_inactive_key(self, client, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
+    async def test_inactive_key(self, client, fake_redis):
         key_hash = hashlib.sha256(b"sk-inactive").hexdigest()
-        await db.create_api_key(key_hash, "u1", name="inactive-key")
-        # Manually deactivate the key.
-        await db._db.execute(
-            "UPDATE api_keys SET is_active = 0 WHERE key_hash = ?", (key_hash,)
-        )
-        await db._db.commit()
-
+        fake_redis._api_keys[key_hash] = {
+            "user_id": "u1",
+            "rate_limit_rpm": 60,
+            "rate_limit_tpm": 100_000,
+            "is_active": False,
+        }
         resp = await client.post(
             "/v1/chat/completions",
             headers={"Authorization": "Bearer sk-inactive"},
         )
         assert resp.status == 401
 
-    async def test_valid_key_success(self, client, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
+    async def test_valid_key_success(self, client, fake_redis):
         key_hash = hashlib.sha256(b"sk-valid").hexdigest()
-        await db.create_api_key(key_hash, "u1", name="valid-key")
-        await db.set_balance("u1", 1000)
+        fake_redis._api_keys[key_hash] = {
+            "user_id": "u1",
+            "rate_limit_rpm": 60,
+            "rate_limit_tpm": 100_000,
+            "is_active": True,
+        }
+        fake_redis._balances["u1"] = 1000
 
         resp = await client.post(
             "/v1/chat/completions",
@@ -230,11 +222,15 @@ class TestAuthMiddleware:
         body = await resp.text()
         assert body == "u1"
 
-    async def test_insufficient_balance(self, client, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
+    async def test_insufficient_balance(self, client, fake_redis):
         key_hash = hashlib.sha256(b"sk-broke").hexdigest()
-        await db.create_api_key(key_hash, "u1", name="broke-key")
-        await db.set_balance("u1", 0)
+        fake_redis._api_keys[key_hash] = {
+            "user_id": "u1",
+            "rate_limit_rpm": 60,
+            "rate_limit_tpm": 100_000,
+            "is_active": True,
+        }
+        fake_redis._balances["u1"] = 0
 
         resp = await client.post(
             "/v1/chat/completions",
@@ -247,65 +243,18 @@ class TestAuthMiddleware:
         resp = await client.post("/v1/chat/completions")
         assert resp.status == 200
 
+    async def test_postgres_fallback_on_cache_miss(self, client, fake_redis, fake_pg):
+        """When Redis cache misses, auth falls back to Postgres and caches the result."""
+        key_hash = hashlib.sha256(b"sk-fallback").hexdigest()
+        # Not in Redis, but in Postgres
+        fake_pg._api_keys[key_hash] = FakeApiKey(user_id="u2")
+        fake_redis._balances["u2"] = 500
 
-# ======================================================================
-# 3. BillingManager tests
-# ======================================================================
-
-
-class TestBillingManager:
-    def test_compute_cost_default_pricing(self):
-        mgr = BillingManager.__new__(BillingManager)
-        mgr._pricing = {}
-        # Default is 100 cents per 1M tokens.
-        # 1000 tokens => ceil(1000 * 100 / 1_000_000) = ceil(0.1) = 1 cent.
-        cost = mgr.compute_cost("some-model", prompt_tokens=500, completion_tokens=500)
-        assert cost == 1
-
-    def test_compute_cost_custom_pricing(self):
-        mgr = BillingManager.__new__(BillingManager)
-        mgr._pricing = {"test": 500.0}
-        # 10000 tokens at 500 cents/1M => ceil(10000 * 500 / 1_000_000) = ceil(5.0) = 5 cents.
-        cost = mgr.compute_cost("test", prompt_tokens=5000, completion_tokens=5000)
-        assert cost == 5
-
-    def test_compute_cost_minimum_1_cent(self):
-        mgr = BillingManager.__new__(BillingManager)
-        mgr._pricing = {}
-        # Even 1 token => max(ceil(1 * 100 / 1_000_000), 1) = max(1, 1) = 1 cent.
-        cost = mgr.compute_cost("any-model", prompt_tokens=1, completion_tokens=0)
-        assert cost == 1
-
-    async def test_record_and_flush(self, db: BillingDB):
-        await db.create_user("u1", "u1@example.com")
-        await db.set_balance("u1", 1000)
-
-        key_hash = hashlib.sha256(b"sk-flush-test").hexdigest()
-        await db.create_api_key(key_hash, "u1")
-
-        mgr = BillingManager(db)
-        await mgr.record_usage(
-            user_id="u1",
-            key_hash=key_hash,
-            model="gpt-4",
-            prompt_tokens=500,
-            completion_tokens=500,
-            latency_ms=100,
+        resp = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-fallback"},
         )
+        assert resp.status == 200
 
-        # Manually drain the queue and flush (simulating the flush loop).
-        events = []
-        while not mgr._queue.empty():
-            events.append(mgr._queue.get_nowait())
-        assert len(events) == 1
-
-        await db.batch_record_usage([e.to_dict() for e in events])
-
-        # Verify event is in DB.
-        unsynced = await db.get_unsynced_events()
-        assert len(unsynced) == 1
-        assert unsynced[0]["user_id"] == "u1"
-
-        # Verify balance was deducted.
-        balance = await db.get_balance("u1")
-        assert balance < 1000
+        # Should now be cached in Redis
+        assert key_hash in fake_redis._api_keys

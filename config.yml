@@ -74,12 +74,15 @@ gateway:
     rate_limit_default_tpm: 100000
 
   billing:
-    db_path: "data/billing.db"
-    flush_interval_s: 1.0
-    stripe_sync_enabled: false
+    postgres_dsn: "postgresql://localhost/shittytoken"
+    redis_url: "redis://localhost:6379/0"
+    reconcile_interval_s: 60.0
     # pricing: per-model overrides (cents per 1M tokens). Default: 100 ($1/1M)
     # pricing:
     #   "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit": 50
+    # kafka (optional — omit to use in-process queue):
+    # kafka_bootstrap_servers: "localhost:9092"
+    # kafka_topic: "shittytoken.usage"
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 orchestrator:

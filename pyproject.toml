@@ -19,12 +19,14 @@ dependencies = [
     "vastai-sdk>=0.5",
     "runpod>=1.8.1",
     "requests>=2.32.5",
-    "aiosqlite>=0.20",
+    "asyncpg>=0.29",
+    "redis[hiredis]>=5.0",
 ]
 
 [project.optional-dependencies]
 billing = [
     "stripe>=8.0",
+    "aiokafka>=0.10",
 ]
 dev = [
     "pytest>=8.0",

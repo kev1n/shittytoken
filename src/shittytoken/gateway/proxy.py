@@ -43,14 +43,31 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             status=400,
         )
 
-    # Build per-request usage callback from billing manager if auth is active.
+    # Build per-request usage callback from billing pipeline.
     on_usage: Callable[[int, int], Awaitable[None]] | Callable[[int, int], None] | None = None
-    billing_mgr = request.app.get("billing_manager")
+    pipeline = request.app.get("billing_pipeline")
     user_id: str | None = request.get("user_id")
     key_hash: str | None = request.get("key_hash")
-    if billing_mgr is not None and user_id is not None and key_hash is not None:
+    request_id: str | None = request.get("request_id")
+    if pipeline is not None and user_id is not None and key_hash is not None:
         model_id = body.get("model", "unknown")
-        on_usage = billing_mgr.on_usage_callback(user_id, key_hash, model_id)
+
+        async def _billing_callback(prompt_tokens: int, completion_tokens: int) -> None:
+            await pipeline.publish_usage(
+                user_id=user_id,
+                key_hash=key_hash,
+                model=model_id,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=0,
+                request_id=request_id,
+            )
+            # Record actual tokens in rate limiter
+            billing_redis = request.app.get("billing_redis")
+            if billing_redis is not None:
+                await billing_redis.record_tokens(key_hash, prompt_tokens + completion_tokens)
+
+        on_usage = _billing_callback
     else:
         on_usage = request.app.get("on_usage")
 
