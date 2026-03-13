@@ -117,12 +117,15 @@ class HeartbeatMonitor:
         self,
         session: aiohttp.ClientSession,
         health_check_interval_s: int = 30,
+        failure_threshold: int = 3,
         on_failure=None,  # async callable(url: str) -> None
     ) -> None:
         self._session = session
         self._interval = health_check_interval_s
+        self._failure_threshold = failure_threshold
         self._on_failure = on_failure
         self._workers: set[str] = set()
+        self._failure_counts: dict[str, int] = {}
         self._running = False
 
     def register(self, url: str) -> None:
@@ -133,6 +136,7 @@ class HeartbeatMonitor:
     def deregister(self, url: str) -> None:
         """Remove *url* from the monitored set (no-op if not present)."""
         self._workers.discard(url)
+        self._failure_counts.pop(url, None)
         logger.info("heartbeat_monitor_deregistered", url=url)
 
     async def run(self) -> None:
@@ -167,12 +171,22 @@ class HeartbeatMonitor:
                 health_url,
                 timeout=aiohttp.ClientTimeout(total=10.0),
             ) as resp:
-                if resp.status != 200:
+                if resp.status == 200:
+                    self._failure_counts[url] = 0
+                else:
                     await self._handle_failure(url, reason=f"HTTP {resp.status}")
         except aiohttp.ClientError as exc:
             await self._handle_failure(url, reason=str(exc))
 
     async def _handle_failure(self, url: str, reason: str) -> None:
-        logger.warning("heartbeat_check_failed", url=url, reason=reason)
-        if self._on_failure is not None:
+        self._failure_counts[url] = self._failure_counts.get(url, 0) + 1
+        count = self._failure_counts[url]
+        logger.warning(
+            "heartbeat_check_failed",
+            url=url,
+            reason=reason,
+            failure_count=count,
+            threshold=self._failure_threshold,
+        )
+        if count == self._failure_threshold and self._on_failure is not None:
             await self._on_failure(url)

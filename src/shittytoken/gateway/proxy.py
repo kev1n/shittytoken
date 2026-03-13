@@ -24,6 +24,13 @@ from shittytoken.gateway import prom_metrics
 
 logger = structlog.get_logger()
 
+
+def _upstream_unavailable() -> web.Response:
+    return web.json_response(
+        {"error": {"message": "Upstream worker unavailable"}},
+        status=502,
+    )
+
 _UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=10)
 
 UsageCallback = Callable[[int, int], Awaitable[None]] | Callable[[int, int], None] | None
@@ -131,12 +138,34 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             timeout=_UPSTREAM_TIMEOUT,
         )
     except (aiohttp.ClientError, TimeoutError) as exc:
-        prom_metrics.dec_active()
-        logger.error("proxy.upstream_connect_error", worker=worker.url, error=str(exc))
-        return web.json_response(
-            {"error": {"message": "Upstream worker unavailable"}},
-            status=502,
-        )
+        logger.warning("proxy.upstream_connect_error", worker=worker.url, error=str(exc))
+        # Retry once with a different worker (non-streaming only)
+        if not client_streaming:
+            retry_worker = pool.select(prefix_key, exclude={worker.url})
+            if retry_worker is not None:
+                retry_url = f"{retry_worker.url.rstrip('/')}/v1/chat/completions"
+                logger.info("proxy.retry_attempt", original=worker.url, retry=retry_worker.url)
+                try:
+                    upstream_resp = await session.post(
+                        retry_url,
+                        json=upstream_body,
+                        timeout=_UPSTREAM_TIMEOUT,
+                    )
+                except (aiohttp.ClientError, TimeoutError) as retry_exc:
+                    prom_metrics.dec_active()
+                    logger.error("proxy.retry_failed", worker=retry_worker.url, error=str(retry_exc))
+                    return _upstream_unavailable()
+                # Update worker reference for logging
+                worker = retry_worker
+                upstream_url = retry_url
+            else:
+                prom_metrics.dec_active()
+                logger.error("proxy.no_retry_worker")
+                return _upstream_unavailable()
+        else:
+            prom_metrics.dec_active()
+            logger.error("proxy.upstream_connect_error_no_retry", worker=worker.url)
+            return _upstream_unavailable()
 
     if upstream_resp.status != 200:
         error_body = await upstream_resp.text()
@@ -269,7 +298,4 @@ async def handle_models(request: web.Request) -> web.Response:
             )
     except (aiohttp.ClientError, TimeoutError) as exc:
         logger.error("proxy.models_upstream_error", worker=worker.url, error=str(exc))
-        return web.json_response(
-            {"error": {"message": "Upstream worker unavailable"}},
-            status=502,
-        )
+        return _upstream_unavailable()

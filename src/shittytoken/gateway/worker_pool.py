@@ -69,9 +69,11 @@ class WorkerPool:
     # Selection & metrics
     # ------------------------------------------------------------------
 
-    def select(self, prefix_key: str) -> WorkerState | None:
-        """Select the best worker for *prefix_key*. Returns WorkerState or None."""
+    def select(self, prefix_key: str, exclude: set[str] | None = None) -> WorkerState | None:
+        """Select the best worker for *prefix_key*, optionally excluding URLs."""
         workers = list(self._workers.values())
+        if exclude:
+            workers = [w for w in workers if w.url not in exclude]
         if not workers:
             return None
         return self._policy.select(prefix_key, workers)

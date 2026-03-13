@@ -36,7 +36,9 @@ from .provisioner import GPUProvider, get_provider
 from .qualification import provision_and_qualify
 from .spot_monitor import spot_eviction_monitor
 from .ssh import SSHManager
-from .state_machine import InstanceState, InstanceStateMachine
+from .cost_tracker import CostTracker
+from .state_machine import InstanceRecord, InstanceState, InstanceStateMachine
+from .state_store import RedisStateStore
 
 logger = structlog.get_logger()
 
@@ -55,11 +57,13 @@ class Orchestrator:
         kg: KnowledgeGraph,
         gateway: GatewayClient,
         approval_fn=None,
+        state_store: RedisStateStore | None = None,
     ) -> None:
         self._settings = settings
         self._kg = kg
         self._gateway = gateway
         self._approval_fn = approval_fn
+        self._state_store = state_store
 
         # instance_id → InstanceStateMachine
         self._instances: dict[str, InstanceStateMachine] = {}
@@ -67,6 +71,8 @@ class Orchestrator:
         self._idle_since: dict[str, float] = {}
         # instance_id → last known running-request count
         self._last_running: dict[str, int] = {}
+
+        self._cost_tracker = CostTracker()
 
         self._provision_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
@@ -92,32 +98,37 @@ class Orchestrator:
         self._heartbeat_monitor = HeartbeatMonitor(
             session=self._session,
             health_check_interval_s=cfg["orchestrator"]["health_check_interval_s"],
+            failure_threshold=cfg["orchestrator"].get("health_failure_threshold", 3),
             on_failure=self._on_worker_failure,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor.run())
 
-        # Start spot eviction monitor for RunPod instances
-        provider_name = cfg["orchestrator"].get("provider", "vastai")
-        if provider_name == "runpod":
-            self._spot_monitor_task = asyncio.create_task(
-                spot_eviction_monitor(
-                    provider=self._get_provider(),
-                    instances=self._instances,
-                    idle_since=self._idle_since,
-                    last_running=self._last_running,
-                    heartbeat_monitor=self._heartbeat_monitor,
-                    gateway=self._gateway,
-                    shutdown_event=self._shutdown_event,
-                    provision_lock=self._provision_lock,
-                    on_reprovision=self._guarded_provision,
-                )
+        # Start instance death monitor for all providers
+        self._spot_monitor_task = asyncio.create_task(
+            spot_eviction_monitor(
+                provider=self._get_provider(),
+                instances=self._instances,
+                idle_since=self._idle_since,
+                last_running=self._last_running,
+                heartbeat_monitor=self._heartbeat_monitor,
+                gateway=self._gateway,
+                shutdown_event=self._shutdown_event,
+                provision_lock=self._provision_lock,
+                on_reprovision=self._guarded_provision,
+                on_state_delete=self._delete_state,
+                on_cost_deregister=lambda iid: self._cost_tracker.deregister(iid),
             )
+        )
 
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(
             signal.SIGTERM,
             lambda: asyncio.create_task(self._shutdown()),
         )
+
+        # Recover instances from previous run
+        if self._state_store:
+            await self._recover_instances()
 
         logger.info("orchestrator_started")
 
@@ -166,6 +177,8 @@ class Orchestrator:
             elif not provisioning:
                 logger.info("min_workers_provision", min_workers=min_workers)
                 asyncio.create_task(self._guarded_provision())
+            await self._sweep_stuck_instances()
+            self._cost_tracker.maybe_log_summary()
             return
 
         metrics = await aggregate_metrics(serving_urls, self._session)
@@ -177,13 +190,20 @@ class Orchestrator:
             avg_kv_cache=round(metrics.avg_kv_cache_usage, 3),
         )
 
-        # Scrape per-worker metrics for idle tracking
-        for sm in self._instances.values():
-            if sm.state == InstanceState.SERVING and sm.record.worker_url:
-                worker_metrics = await scrape_worker_metrics(
-                    sm.record.worker_url, self._session
-                )
-                running = int(worker_metrics.get("num_requests_running", 0))
+        # Scrape per-worker metrics concurrently
+        serving_sms = [
+            sm for sm in self._instances.values()
+            if sm.state == InstanceState.SERVING and sm.record.worker_url
+        ]
+        if serving_sms:
+            scrape_results = await asyncio.gather(
+                *(scrape_worker_metrics(sm.record.worker_url, self._session) for sm in serving_sms),
+                return_exceptions=True,
+            )
+            for sm, result in zip(serving_sms, scrape_results):
+                if isinstance(result, Exception):
+                    continue
+                running = int(result.get("num_requests_running", 0))
                 self._last_running[sm.record.instance_id] = running
 
         # Update idle tracking per instance
@@ -213,6 +233,9 @@ class Orchestrator:
         elif len(serving_urls) > min_workers:
             await self._maybe_scale_down(metrics)
 
+        await self._sweep_stuck_instances()
+        self._cost_tracker.maybe_log_summary()
+
     # ------------------------------------------------------------------
     # Provisioning
     # ------------------------------------------------------------------
@@ -234,6 +257,9 @@ class Orchestrator:
                 )
                 if record is not None and sm is not None:
                     self._instances[record.instance_id] = sm
+                    await self._save_state(record)
+                    if record.cost_per_hour_usd:
+                        self._cost_tracker.register(record.instance_id, record.cost_per_hour_usd)
                 elif sm is not None:
                     # Instance was created but qualification failed — destroy it
                     await self._destroy_instance(sm.record, sm)
@@ -253,6 +279,122 @@ class Orchestrator:
                     if sm.state in (InstanceState.PROVISIONING, InstanceState.BENCHMARKING):
                         logger.info("provision_cleanup_orphan", instance_id=sm.record.instance_id, state=sm.state.value)
                         await self._destroy_instance(sm.record, sm)
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    async def _save_state(self, record: InstanceRecord) -> None:
+        """Persist instance record to Redis if a state store is configured."""
+        if self._state_store:
+            await self._state_store.save(record)
+
+    async def _delete_state(self, instance_id: str) -> None:
+        """Remove instance record from Redis if a state store is configured."""
+        if self._state_store:
+            await self._state_store.delete(instance_id)
+
+    async def _recover_instances(self) -> None:
+        """Reload instance records from Redis and recover or clean up each one."""
+        records = await self._state_store.load_all()
+        if not records:
+            logger.info("recovery_no_instances")
+            return
+
+        logger.info("recovery_starting", count=len(records))
+        provider = self._get_provider()
+
+        # Verify all instances concurrently
+        poll_results = await asyncio.gather(
+            *(provider.get_instance(r.instance_id) for r in records),
+            return_exceptions=True,
+        )
+
+        for record, result in zip(records, poll_results):
+            if isinstance(result, Exception):
+                instance_alive = False
+                instance_info = None
+            else:
+                instance_info = result
+                instance_alive = bool(instance_info)
+
+            if (
+                instance_alive
+                and record.state == InstanceState.SERVING
+                and record.worker_url
+            ):
+                # Verify the vLLM process is actually responding
+                try:
+                    async with self._session.get(
+                        record.worker_url.rstrip("/") + "/health",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        worker_healthy = resp.status == 200
+                except Exception:
+                    worker_healthy = False
+
+                if worker_healthy:
+                    # Recover: re-create state machine, register with monitors
+                    sm = InstanceStateMachine(record)
+                    self._instances[record.instance_id] = sm
+                    self._heartbeat_monitor.register(record.worker_url)
+                    await self._gateway.register_worker(record.worker_url)
+                    if record.cost_per_hour_usd:
+                        self._cost_tracker.register(record.instance_id, record.cost_per_hour_usd)
+                    logger.info(
+                        "recovery_instance_restored",
+                        instance_id=record.instance_id,
+                        worker_url=record.worker_url,
+                    )
+                    continue
+
+                # Instance VM is alive but vLLM crashed — treat as dead
+                logger.info(
+                    "recovery_worker_unhealthy",
+                    instance_id=record.instance_id,
+                    worker_url=record.worker_url,
+                )
+
+            # Dead, in-progress, or unhealthy instance — clean up
+            logger.info(
+                "recovery_instance_cleanup",
+                instance_id=record.instance_id,
+                state=record.state.value,
+                alive=instance_alive,
+            )
+            try:
+                await provider.destroy_instance(record.instance_id)
+            except Exception as exc:
+                logger.warning(
+                    "recovery_destroy_failed",
+                    instance_id=record.instance_id,
+                    error=str(exc),
+                )
+            await self._state_store.delete(record.instance_id)
+
+    # ------------------------------------------------------------------
+    # Stuck instance sweep
+    # ------------------------------------------------------------------
+
+    async def _sweep_stuck_instances(self) -> None:
+        """Destroy instances stuck in PROVISIONING or BENCHMARKING too long."""
+        stuck_timeout = cfg["orchestrator"].get("stuck_instance_timeout_s", 1320)
+        now = time.time()
+
+        for sm in list(self._instances.values()):
+            if sm.state not in (InstanceState.PROVISIONING, InstanceState.BENCHMARKING):
+                continue
+            elapsed = now - sm.record.state_changed_at
+            if elapsed > stuck_timeout:
+                logger.warning(
+                    "stuck_instance_sweep",
+                    instance_id=sm.record.instance_id,
+                    state=sm.state.value,
+                    elapsed_s=round(elapsed, 1),
+                    timeout_s=stuck_timeout,
+                )
+                sm.transition(InstanceState.FAILED, reason="stuck_timeout")
+                await self._destroy_instance(sm.record, sm)
 
     # ------------------------------------------------------------------
     # Scale down
@@ -396,7 +538,7 @@ class Orchestrator:
         try:
             provider = self._get_provider()
             await provider.destroy_instance(record.instance_id)
-        except (aiohttp.ClientError, Exception) as exc:
+        except Exception as exc:
             logger.error(
                 "destroy_instance_failed",
                 instance_id=record.instance_id,
@@ -404,12 +546,15 @@ class Orchestrator:
                 error=str(exc),
             )
 
+        self._cost_tracker.deregister(record.instance_id)
+
         if sm.state not in (InstanceState.TERMINATED, InstanceState.FAILED):
             sm.transition(InstanceState.TERMINATED, reason="instance_destroyed")
 
         self._instances.pop(record.instance_id, None)
         self._idle_since.pop(record.instance_id, None)
         self._last_running.pop(record.instance_id, None)
+        await self._delete_state(record.instance_id)
 
     async def _on_worker_failure(self, url: str) -> None:
         """Callback from HeartbeatMonitor when a worker fails health checks."""
@@ -419,7 +564,7 @@ class Orchestrator:
                 sm.transition(InstanceState.DRAINING, reason="health_check_failure")
                 self._heartbeat_monitor.deregister(url)
                 try:
-                    await self._gateway.deregister_worker(url, drain=False)
+                    await self._gateway.deregister_worker(url, drain=True)
                 except KeyError:
                     pass
                 await self._destroy_instance(sm.record, sm)
@@ -478,13 +623,28 @@ async def main() -> None:
     registry = WorkerRegistry(router_manager=router_manager)
     gateway = GatewayClient(registry=registry)
 
+    # State store for instance recovery across restarts
+    state_store = None
+    redis_url = cfg["orchestrator"].get("redis_url")
+    if redis_url:
+        state_store = await RedisStateStore.create(url=redis_url)
+        log.info("state_store_enabled", redis_url=redis_url)
+
     auto_approve = os.getenv("SHITTYTOKEN_AUTO_APPROVE", "").strip() in ("1", "true")
     approval_fn = None if auto_approve else interactive_approval
 
     orchestrator = Orchestrator(
-        settings=settings, kg=kg, gateway=gateway, approval_fn=approval_fn
+        settings=settings,
+        kg=kg,
+        gateway=gateway,
+        approval_fn=approval_fn,
+        state_store=state_store,
     )
-    await orchestrator.run()
+    try:
+        await orchestrator.run()
+    finally:
+        if state_store:
+            await state_store.close()
 
 
 if __name__ == "__main__":

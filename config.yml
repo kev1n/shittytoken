@@ -115,6 +115,7 @@ gateway:
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 orchestrator:
+  redis_url: "redis://localhost:6379/0"  # shared with billing
   provider: vastai # vastai | runpod
   min_workers: 1
   scale_up_waiting_threshold: 10
@@ -122,9 +123,12 @@ orchestrator:
   scale_down_cache_max: 0.50
   metrics_poll_interval_s: 10
   health_check_interval_s: 30
+  health_failure_threshold: 3
   startup_monitor_timeout_s: 1200
   provision_cooldown_s: 60
+  stuck_instance_timeout_s: 1320  # startup_monitor_timeout_s + 120
   ssh_ready_timeout_s: 600 # max time to wait for SSH after renting
+  instance_poll_interval_sec: 15
 
   # RunPod-specific settings (spot only)
   runpod:

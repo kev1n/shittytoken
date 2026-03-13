@@ -58,6 +58,7 @@ class InstanceRecord:
     config_id: str = ""    # KG Configuration.config_id
     created_at: float = field(default_factory=time.time)
     state_changed_at: float = field(default_factory=time.time)
+    cost_per_hour_usd: float = 0.0
 
 
 class InstanceStateMachine:

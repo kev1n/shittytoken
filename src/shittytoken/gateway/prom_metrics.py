@@ -113,5 +113,15 @@ async def handle_metrics(request: web.Request) -> web.Response:
         lines.append("# TYPE num_requests_waiting gauge")
         lines.append("num_requests_waiting 0")
 
+    # -- Cost metrics (populated if orchestrator is in-process) --------
+    cost_tracker = request.app.get("cost_tracker")
+    if cost_tracker is not None:
+        lines.append("# HELP shittytoken_hourly_burn_usd Current hourly burn rate in USD.")
+        lines.append("# TYPE shittytoken_hourly_burn_usd gauge")
+        lines.append(f"shittytoken_hourly_burn_usd {cost_tracker.hourly_burn_usd:.4f}")
+        lines.append("# HELP shittytoken_cumulative_cost_usd Total cumulative cost in USD.")
+        lines.append("# TYPE shittytoken_cumulative_cost_usd gauge")
+        lines.append(f"shittytoken_cumulative_cost_usd {cost_tracker.cumulative_cost_usd:.4f}")
+
     body = "\n".join(lines) + "\n"
     return web.Response(text=body, content_type="text/plain; version=0.0.4")
