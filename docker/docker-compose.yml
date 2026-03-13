@@ -15,6 +15,34 @@ services:
       timeout: 5s
       retries: 5
 
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: shittytoken
+      POSTGRES_USER: shittytoken
+      POSTGRES_PASSWORD: shittytoken_dev
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shittytoken -d shittytoken"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   mock-worker:
     build:
       context: ..
@@ -39,3 +67,5 @@ services:
 
 volumes:
   neo4j_data:
+  postgres_data:
+  redis_data:
