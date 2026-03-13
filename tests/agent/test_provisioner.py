@@ -103,9 +103,12 @@ class TestBuildVllmCommand:
         cmd = build_vllm_command(_make_config(), MODEL_ID)
         assert "--enable-prefix-caching" in cmd
 
-    def test_always_has_ipc_host(self):
+    def test_has_host_and_port(self):
         cmd = build_vllm_command(_make_config(), MODEL_ID)
-        assert "--ipc=host" in cmd
+        assert "--host" in cmd
+        assert "--port" in cmd
+        assert "0.0.0.0" in cmd
+        assert "8080" in cmd
 
     def test_model_id_is_first_positional(self):
         cmd = build_vllm_command(_make_config(), MODEL_ID)

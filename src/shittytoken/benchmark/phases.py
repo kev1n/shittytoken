@@ -1,5 +1,6 @@
 import asyncio
 import time
+from dataclasses import dataclass
 
 import aiohttp
 import structlog
@@ -7,6 +8,9 @@ import structlog
 from .constants import (
     CONCURRENCY_LEVELS,
     FIRST_TOKEN_TIMEOUT_SEC,
+    LONG_CONTEXT_OUTPUT_TOKENS,
+    LONG_CONTEXT_REQUEST_TIMEOUT_SEC,
+    LONG_CONTEXT_STEPS_TOKENS,
     REQUEST_TIMEOUT_SEC,
     WARM_UP_REQUESTS_PER_PREFIX,
 )
@@ -15,6 +19,7 @@ from .request_generator import VirtualUserPool
 from .results_analyzer import compute_throughput_tps, compute_ttft_percentile
 from .schema import ConcurrencyPoint, PhaseMetrics
 from .sse_client import RequestResult, send_chat_completion
+from .workloads import WorkloadProfile, make_system_prompt, make_query
 
 logger = structlog.get_logger()
 
@@ -293,3 +298,120 @@ async def _run_at_concurrency(
 
     await asyncio.gather(*tasks, return_exceptions=True)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Long-context agent flow
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LongContextStep:
+    target_context_tokens: int
+    actual_context_chars: int
+    ttft_sec: float | None
+    total_duration_sec: float
+    tokens_generated: int
+    success: bool
+    error: str | None
+
+
+async def run_phase_4_long_context(
+    collector: MetricsCollector,
+    session: aiohttp.ClientSession,
+    base_url: str,
+) -> tuple[PhaseMetrics, list[LongContextStep]]:
+    """
+    Phase 4: Agent-style long-context ramp.
+
+    Simulates an agentic workflow where context grows over multiple turns:
+    a large system prompt + accumulating assistant/user turns that push the
+    context window from 8k tokens up to 131k tokens.
+
+    Each step sends ONE request at the target context length and records TTFT.
+    """
+    collector.mark_phase(4)
+    steps = LONG_CONTEXT_STEPS_TOKENS
+    logger.info("phase_4.start", context_steps=steps)
+
+    start = time.monotonic()
+    results: list[RequestResult] = []
+    step_details: list[LongContextStep] = []
+
+    # Build a single conversation that grows across steps.
+    # Start with a large coding system prompt, then pad context with
+    # synthetic "prior agent turns" to reach the target token count.
+    messages: list[dict] = [
+        {"role": "system", "content": make_system_prompt(WorkloadProfile.CODING, 2000)},
+    ]
+    current_context_chars = 2000 * 4  # approximate
+
+    for step_tokens in steps:
+        target_chars = step_tokens * 4
+        # Pad with synthetic prior turns to reach the target context size
+        chars_needed = target_chars - current_context_chars
+        if chars_needed > 0:
+            # Add padding as prior "agent thinking" turns
+            pad_text = make_system_prompt(WorkloadProfile.DOCUMENT_QA, chars_needed // 4)
+            messages.append({"role": "assistant", "content": pad_text})
+            current_context_chars += len(pad_text)
+
+        # Add the actual user query for this step
+        query = make_query(WorkloadProfile.CODING, 200)
+        messages.append({"role": "user", "content": query})
+        current_context_chars += len(query)
+
+        logger.info(
+            "phase_4.step_start",
+            target_tokens=step_tokens,
+            context_chars=current_context_chars,
+            num_messages=len(messages),
+        )
+
+        result = await send_chat_completion(
+            session,
+            base_url,
+            list(messages),  # copy
+            LONG_CONTEXT_OUTPUT_TOKENS,
+            f"long-context-{step_tokens}",
+            LONG_CONTEXT_REQUEST_TIMEOUT_SEC,
+            LONG_CONTEXT_REQUEST_TIMEOUT_SEC,  # TTFT can be slow for long context
+        )
+        results.append(result)
+
+        step = LongContextStep(
+            target_context_tokens=step_tokens,
+            actual_context_chars=current_context_chars,
+            ttft_sec=result.ttft_sec,
+            total_duration_sec=result.total_duration_sec,
+            tokens_generated=result.tokens_generated,
+            success=result.success,
+            error=result.error,
+        )
+        step_details.append(step)
+
+        logger.info(
+            "phase_4.step_complete",
+            target_tokens=step_tokens,
+            success=result.success,
+            ttft_sec=round(result.ttft_sec, 2) if result.ttft_sec else None,
+            duration_sec=round(result.total_duration_sec, 2),
+            tokens_generated=result.tokens_generated,
+            error=result.error[:100] if result.error else None,
+        )
+
+        # Append the model's reply so context grows naturally
+        if result.success and result.output_text:
+            messages.append({"role": "assistant", "content": result.output_text})
+            current_context_chars += len(result.output_text)
+
+    duration_sec = time.monotonic() - start
+    logger.info(
+        "phase_4.complete",
+        duration_sec=round(duration_sec, 1),
+        steps_passed=sum(1 for s in step_details if s.success),
+        steps_total=len(step_details),
+    )
+
+    phase_metrics = _build_phase_metrics(4, duration_sec, results, collector)
+    return phase_metrics, step_details

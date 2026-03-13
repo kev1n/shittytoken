@@ -48,6 +48,11 @@ async def monitor_startup(
     async def _read_lines() -> tuple[str, str]:
         async for line in line_generator:
             buffer.append(line)
+
+            # Surface VM log lines so the operator can follow progress
+            if line.strip():
+                logger.info("vm_log", line=line.rstrip()[:200], lines_so_far=len(buffer))
+
             if READINESS_PATTERN.search(line):
                 return (StartupResult.READY, line)
             if OOM_PATTERN.search(line):

@@ -53,8 +53,19 @@ async def send_chat_completion(
     - Catches aiohttp.ClientError, asyncio.TimeoutError — returns failed result.
     """
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    # Sanitize messages: strip control characters that break JSON parsing
+    # on the vLLM side (model output can contain arbitrary bytes).
+    clean_messages = []
+    for msg in messages:
+        content = msg.get("content", "")
+        # Remove ASCII control chars except \n and \t
+        clean_content = "".join(
+            c if c >= " " or c in "\n\t" else " " for c in content
+        )
+        clean_messages.append({**msg, "content": clean_content})
+
     payload = {
-        "messages": messages,
+        "messages": clean_messages,
         "max_tokens": max_tokens,
         "stream": True,
     }

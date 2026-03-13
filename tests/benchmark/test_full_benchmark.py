@@ -73,8 +73,10 @@ async def test_full_pipeline_passes(mock_app_server):
     )
     assert result.fail_reasons == []
     # Sanity checks on populated fields.
-    assert len(result.phase_metrics) == 3
-    assert len(result.concurrency_sweep) == 7
+    assert len(result.phase_metrics) >= 3  # 3 base + optional phase 4
+    assert len(result.concurrency_sweep) == len(
+        __import__("shittytoken.benchmark.constants", fromlist=["CONCURRENCY_LEVELS"]).CONCURRENCY_LEVELS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +184,8 @@ async def test_result_fields_populated(mock_app_server):
     assert result.phase_metrics[0].phase_number == 1
     assert result.phase_metrics[1].phase_number == 2
     assert result.phase_metrics[2].phase_number == 3
-    # concurrency_sweep should have 7 levels.
-    assert len(result.concurrency_sweep) == 7
+    # concurrency_sweep should match configured levels.
+    from shittytoken.benchmark.constants import CONCURRENCY_LEVELS
+    assert len(result.concurrency_sweep) == len(CONCURRENCY_LEVELS)
     sweep_concurrencies = [p.concurrency for p in result.concurrency_sweep]
-    assert sweep_concurrencies == [1, 2, 4, 8, 16, 32, 64]
+    assert sweep_concurrencies == CONCURRENCY_LEVELS

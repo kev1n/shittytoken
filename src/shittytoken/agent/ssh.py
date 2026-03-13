@@ -57,6 +57,7 @@ class SSHManager:
         Returns an SSHSession containing the live connection.
         Raises asyncssh.Error on connection failure.
         """
+        logger.info("ssh_connecting", host=host, port=port, username=username)
         conn = await asyncio.wait_for(
             asyncssh.connect(
                 host=host,
@@ -67,7 +68,7 @@ class SSHManager:
                 keepalive_interval=self._keepalive_interval,
                 keepalive_count_max=self._keepalive_count_max,
             ),
-            timeout=30.0,
+            timeout=120.0,
         )
         session = SSHSession(host=host, port=port, _conn=conn)
         logger.info("ssh_connected", host=host, port=port, username=username)
@@ -190,7 +191,9 @@ class SSHManager:
                 f"SSHSession for {session.host}:{session.port} has no active connection"
             )
 
-        command = "tail -f /proc/1/fd/1"
+        # On Vast.ai, onstart_cmd output goes to /var/log/onstart.log,
+        # not /proc/1/fd/1 (which is the init shell's stdout).
+        command = "tail -f /var/log/onstart.log 2>/dev/null || tail -f /proc/1/fd/1"
         try:
             async with session._conn.create_process(command) as proc:
                 async for line in proc.stdout:

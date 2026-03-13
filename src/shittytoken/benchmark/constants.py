@@ -32,3 +32,12 @@ FIRST_TOKEN_TIMEOUT_SEC: float = _b["first_token_timeout_sec"]
 # Virtual users
 RETURNING_USER_FRACTION: float = _b["returning_user_fraction"]
 MAX_SESSIONS: int = _b["max_sessions"]
+
+# Long-context agent flow (phase 4)
+_lc = _b.get("long_context", {})
+LONG_CONTEXT_ENABLED: bool = _lc.get("enabled", False)
+LONG_CONTEXT_STEPS_TOKENS: list[int] = _lc.get(
+    "context_steps_tokens", [8192, 16384, 32768, 65536, 131072]
+)
+LONG_CONTEXT_OUTPUT_TOKENS: int = _lc.get("output_tokens_per_step", 512)
+LONG_CONTEXT_REQUEST_TIMEOUT_SEC: float = _lc.get("request_timeout_sec", 300.0)

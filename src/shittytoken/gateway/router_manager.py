@@ -1,21 +1,14 @@
 """
-RouterManager — lifecycle management for the vLLM Router (Rust binary).
+RouterManager — lifecycle management for the custom Python router.
 
-Install: uv pip install vllm-router
-Repo:    https://github.com/vllm-project/router
-
-Backend changes use --dynamic-config-json: the router polls a JSON config
-file every ~10 seconds and hot-reloads backends WITHOUT restarting the
-process. No connections are dropped during scaling events.
-
-Process management uses asyncio.create_subprocess_exec() exclusively —
-no shell=True, no subprocess.Popen.
+Launches the router as a subprocess (``python -m shittytoken.gateway.router``)
+and manages workers via the admin HTTP API for hot-reload — no process
+restarts needed when workers are added or removed.
 """
 
 import asyncio
-import json
+import sys
 import time
-from pathlib import Path
 
 import aiohttp
 import structlog
@@ -24,93 +17,32 @@ from ..config import cfg
 
 logger = structlog.get_logger()
 
-VLLM_ROUTER_BINARY = "vllm-router"
-
-# All config from config.yml
 _router_cfg = cfg["gateway"]["router"]
-VLLM_ROUTER_PORT = _router_cfg["port"]
-VLLM_ROUTER_METRICS_PORT = _router_cfg["metrics_port"]
+ROUTER_PORT = _router_cfg["port"]
 HEALTH_CHECK_TIMEOUT_SEC = _router_cfg["health_check_timeout_sec"]
-_DEFAULT_CONFIG_PATH = _router_cfg["config_path"]
+_ADMIN_BASE = f"http://localhost:{ROUTER_PORT}/admin/workers"
+_HEALTH_URL = f"http://localhost:{ROUTER_PORT}/health"
 
 
 class RouterManager:
     """
-    Manages the vLLM Router (Rust binary) process lifecycle.
+    Manages the custom router subprocess and its worker pool via admin API.
 
-    Worker pool changes are handled by rewriting the dynamic config JSON
-    file. The router polls this file and hot-reloads backends — no process
-    restart, no dropped connections.
+    Workers are added/removed via HTTP — no process restart needed.
     """
 
-    def __init__(
-        self,
-        policy: str | None = None,
-        static_models: list[str] | None = None,
-        config_path: str | None = None,
-    ) -> None:
-        self._policy = policy or _router_cfg["policy"]
-        self._static_models = static_models or []
-        self._worker_urls: list[str] = []
-        self._config_path = Path(config_path or _DEFAULT_CONFIG_PATH)
+    def __init__(self) -> None:
         self._process: asyncio.subprocess.Process | None = None
-
-    # ------------------------------------------------------------------
-    # Dynamic config file
-    # ------------------------------------------------------------------
-
-    def _write_config(self, worker_urls: list[str]) -> None:
-        """
-        Write the dynamic config JSON file that the router polls.
-
-        Format per vLLM Router docs:
-        https://docs.vllm.ai/projects/production-stack/en/latest/user_manual/router/json.html
-        """
-        config = {
-            "service_discovery": "static",
-            "routing_logic": self._policy,
-            "static_backends": ",".join(worker_urls) if worker_urls else "",
-        }
-        if self._static_models:
-            config["static_models"] = ",".join(self._static_models)
-
-        self._config_path.write_text(json.dumps(config, indent=2))
-        logger.info(
-            "router_config_written",
-            path=str(self._config_path),
-            worker_count=len(worker_urls),
-        )
+        self._admin_token: str | None = _router_cfg.get("admin_token")
+        self._known_workers: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def build_startup_command(self) -> list[str]:
-        """
-        Returns the argv list used to launch the vLLM Router binary.
-
-        Uses --dynamic-config-json so the router watches the config file
-        for backend changes without needing a restart.
-        """
-        return [
-            VLLM_ROUTER_BINARY,
-            "--port", str(VLLM_ROUTER_PORT),
-            "--dynamic-config-json", str(self._config_path),
-            "--prometheus-port", str(VLLM_ROUTER_METRICS_PORT),
-            "--engine-stats-interval", str(_router_cfg["engine_stats_interval"]),
-            "--log-stats",
-        ]
-
     async def start(self, worker_urls: list[str]) -> None:
-        """
-        Write the initial config file, launch the vLLM Router process,
-        and wait until its /health endpoint returns 200.
-
-        Raises RuntimeError if the health check does not pass within
-        HEALTH_CHECK_TIMEOUT_SEC.
-        """
-        self._write_config(worker_urls)
-        cmd = self.build_startup_command()
+        """Launch the router subprocess, wait for health, register initial workers."""
+        cmd = [sys.executable, "-m", "shittytoken.gateway.router"]
         logger.info("router_starting", cmd=cmd)
 
         self._process = await asyncio.create_subprocess_exec(
@@ -120,41 +52,50 @@ class RouterManager:
         )
 
         if not await self._wait_for_health():
+            stderr_bytes = b""
+            if self._process.stderr:
+                try:
+                    stderr_bytes = await asyncio.wait_for(
+                        self._process.stderr.read(4096), timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            stderr_text = stderr_bytes.decode(errors="replace").strip()
             raise RuntimeError(
-                f"vLLM Router did not become healthy within "
-                f"{HEALTH_CHECK_TIMEOUT_SEC}s after start"
+                f"Router did not become healthy within "
+                f"{HEALTH_CHECK_TIMEOUT_SEC}s. stderr: {stderr_text[:500]}"
             )
 
-        self._worker_urls = list(worker_urls)
-        logger.info(
-            "router_started",
-            pid=self._process.pid,
-            worker_count=len(worker_urls),
-        )
+        logger.info("router_started", pid=self._process.pid)
+
+        # Register initial workers
+        for url in worker_urls:
+            await self._add_worker(url)
 
     async def reload(self, worker_urls: list[str]) -> None:
-        """
-        Update the backend pool by rewriting the dynamic config file.
-
-        The router polls the file every ~10 seconds and hot-reloads.
-        No process restart. No dropped connections.
-
-        If the router process is not running, starts it.
-        """
-        self._write_config(worker_urls)
-        self._worker_urls = list(worker_urls)
-
-        if self._process is None or self._process.returncode is not None:
-            logger.warning("router_not_running_starting")
+        """Diff current vs desired workers and add/remove via admin API."""
+        if not self._is_running():
             await self.start(worker_urls)
             return
 
+        desired = set(worker_urls)
+        to_add = desired - self._known_workers
+        to_remove = self._known_workers - desired
+
+        if not to_add and not to_remove:
+            logger.debug("router_reload_noop", worker_count=len(worker_urls))
+            return
+
         logger.info(
-            "router_config_updated",
-            worker_count=len(worker_urls),
-            pid=self._process.pid,
-            note="router will pick up changes within ~10s",
+            "router_reload",
+            adding=len(to_add),
+            removing=len(to_remove),
         )
+
+        for url in to_remove:
+            await self._remove_worker(url)
+        for url in to_add:
+            await self._add_worker(url)
 
     async def stop(self) -> None:
         """Terminate the router process gracefully."""
@@ -163,46 +104,102 @@ class RouterManager:
         logger.info("router_stopping", pid=self._process.pid)
         await self._terminate_process(self._process)
         self._process = None
-
-        # Clean up config file
-        if self._config_path.exists():
-            self._config_path.unlink()
-
+        self._known_workers.clear()
         logger.info("router_stopped")
 
     async def is_healthy(self, session: aiohttp.ClientSession | None = None) -> bool:
-        """
-        Probe GET http://localhost:{VLLM_ROUTER_PORT}/health.
-        Returns False on any error — never raises.
-        """
-        url = f"http://localhost:{VLLM_ROUTER_PORT}/health"
+        """Probe GET /health. Returns False on any error."""
         try:
             if session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                async with session.get(_HEALTH_URL, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                     return resp.status == 200
             else:
                 async with aiohttp.ClientSession() as temp:
-                    async with temp.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                    async with temp.get(_HEALTH_URL, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                         return resp.status == 200
-        except Exception:  # noqa: BLE001 — intentional catch-all for health probe
+        except Exception:  # noqa: BLE001
             return False
 
     @property
     def current_workers(self) -> list[str]:
-        return list(self._worker_urls)
+        return sorted(self._known_workers)
+
+    # ------------------------------------------------------------------
+    # Admin API calls
+    # ------------------------------------------------------------------
+
+    def _admin_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self._admin_token:
+            headers["X-Admin-Token"] = self._admin_token
+        return headers
+
+    async def _add_worker(self, url: str) -> None:
+        """POST /admin/workers to register a worker."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                _ADMIN_BASE,
+                json={"url": url},
+                headers=self._admin_headers(),
+                timeout=aiohttp.ClientTimeout(total=10.0),
+            ) as resp:
+                if resp.status == 201:
+                    self._known_workers.add(url)
+                    logger.info("router_manager.worker_added", url=url)
+                elif resp.status == 409:
+                    # Already present — sync our state
+                    self._known_workers.add(url)
+                    logger.debug("router_manager.worker_already_present", url=url)
+                else:
+                    body = await resp.text()
+                    logger.error(
+                        "router_manager.add_worker_failed",
+                        url=url,
+                        status=resp.status,
+                        body=body[:200],
+                    )
+
+    async def _remove_worker(self, url: str) -> None:
+        """DELETE /admin/workers to deregister a worker."""
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(
+                _ADMIN_BASE,
+                json={"url": url},
+                headers=self._admin_headers(),
+                timeout=aiohttp.ClientTimeout(total=10.0),
+            ) as resp:
+                if resp.status == 200:
+                    self._known_workers.discard(url)
+                    logger.info("router_manager.worker_removed", url=url)
+                elif resp.status == 404:
+                    self._known_workers.discard(url)
+                    logger.debug("router_manager.worker_already_gone", url=url)
+                else:
+                    body = await resp.text()
+                    logger.error(
+                        "router_manager.remove_worker_failed",
+                        url=url,
+                        status=resp.status,
+                        body=body[:200],
+                    )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _is_running(self) -> bool:
+        return self._process is not None and self._process.returncode is None
+
     async def _wait_for_health(self) -> bool:
-        """
-        Poll /health until it returns 200 or HEALTH_CHECK_TIMEOUT_SEC elapses.
-        Returns True if healthy, False on timeout.
-        """
         deadline = time.monotonic() + HEALTH_CHECK_TIMEOUT_SEC
         async with aiohttp.ClientSession() as session:
             while time.monotonic() < deadline:
+                if self._process and self._process.returncode is not None:
+                    logger.error(
+                        "router_process_exited_during_startup",
+                        returncode=self._process.returncode,
+                    )
+                    return False
                 if await self.is_healthy(session):
                     return True
                 await asyncio.sleep(0.5)
@@ -213,22 +210,13 @@ class RouterManager:
         process: asyncio.subprocess.Process,
         sigkill_after_sec: float = 5.0,
     ) -> None:
-        """
-        Send SIGTERM; if the process is still alive after *sigkill_after_sec*,
-        send SIGKILL.
-        """
         try:
             process.terminate()
             try:
                 await asyncio.wait_for(process.wait(), timeout=sigkill_after_sec)
             except asyncio.TimeoutError:
-                logger.warning(
-                    "router_process_sigkill",
-                    pid=process.pid,
-                    reason="did not exit after SIGTERM within timeout",
-                )
+                logger.warning("router_process_sigkill", pid=process.pid)
                 process.kill()
                 await process.wait()
         except ProcessLookupError:
-            # Process already exited — nothing to do.
             pass

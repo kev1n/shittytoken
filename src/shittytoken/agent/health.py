@@ -35,9 +35,18 @@ async def wait_for_model_ready(
     """
     url = base_url.rstrip("/") + "/v1/models"
     deadline = time.monotonic() + timeout_sec
+    start = time.monotonic()
     log = logger.bind(worker_url=base_url)
+    attempt = 0
+
+    log.info(
+        "worker_model_poll_started",
+        url=url,
+        timeout_sec=timeout_sec,
+    )
 
     while time.monotonic() < deadline:
+        attempt += 1
         try:
             async with session.get(
                 url,
@@ -55,13 +64,34 @@ async def wait_for_model_ready(
                         await asyncio.sleep(poll_interval_sec)
                         continue
                     if models:
+                        elapsed = time.monotonic() - start
                         log.info(
                             "worker_model_ready",
                             model_count=len(models),
+                            elapsed_s=round(elapsed, 1),
+                            attempts=attempt,
                         )
                         return True
+                else:
+                    # Log non-200 periodically (every 30s)
+                    if attempt % 6 == 0:
+                        elapsed = time.monotonic() - start
+                        log.info(
+                            "worker_model_poll_waiting",
+                            status=resp.status,
+                            elapsed_s=round(elapsed, 1),
+                            attempts=attempt,
+                        )
         except aiohttp.ClientError as exc:
-            log.debug("worker_model_poll_error", error=str(exc))
+            # Log connection errors periodically (every 30s)
+            if attempt % 6 == 0:
+                elapsed = time.monotonic() - start
+                log.info(
+                    "worker_model_poll_waiting",
+                    error=str(exc)[:100],
+                    elapsed_s=round(elapsed, 1),
+                    attempts=attempt,
+                )
 
         await asyncio.sleep(poll_interval_sec)
 

@@ -5,7 +5,13 @@ import aiohttp
 import structlog
 
 from .metrics_collector import MetricsCollector
-from .phases import run_phase_1_cold_cache, run_phase_2_warmup, run_phase_3_sustained
+from .constants import LONG_CONTEXT_ENABLED
+from .phases import (
+    run_phase_1_cold_cache,
+    run_phase_2_warmup,
+    run_phase_3_sustained,
+    run_phase_4_long_context,
+)
 from .request_generator import VirtualUserPool
 from .results_analyzer import evaluate_benchmark
 from .schema import BenchmarkResult, BenchmarkVerdict, FailReason
@@ -70,6 +76,14 @@ async def run_benchmark(
                     worker_url,
                     level_duration_sec=level_duration_sec,
                 )
+
+                # Phase 4: long-context agent flow (optional)
+                phase4 = None
+                long_context_steps = None
+                if LONG_CONTEXT_ENABLED:
+                    phase4, long_context_steps = await run_phase_4_long_context(
+                        collector, session, worker_url
+                    )
             finally:
                 collector.stop()
                 if collector_task is not None:
@@ -127,10 +141,26 @@ async def run_benchmark(
         )
 
     duration_sec = result.completed_at - result.started_at
-    logger.info(
-        "benchmark_complete",
-        verdict=result.verdict,
-        duration_sec=duration_sec,
-        fail_reasons=[r.value for r in result.fail_reasons],
-    )
+
+    # ── Summary log (easy to grep for monitoring) ─────────────────────────
+    summary = {
+        "verdict": result.verdict.value,
+        "duration_sec": round(duration_sec, 1),
+        "cold_ttft_p95": round(result.cold_cache_baseline_ttft_p95, 2),
+        "warm_ttft_p95": round(result.warm_cache_ttft_p95_at_concurrency_1, 2),
+        "peak_tps": round(result.peak_throughput_tokens_per_sec, 1),
+    }
+    if result.fail_reasons:
+        summary["fail_reasons"] = [r.value for r in result.fail_reasons]
+    if result.concurrency_sweep:
+        summary["sweep"] = {
+            p.concurrency: {
+                "tps": round(p.throughput_tokens_per_sec, 1),
+                "ttft_p95": round(p.ttft_p95_sec, 2),
+                "failed": p.failed_request_count,
+            }
+            for p in result.concurrency_sweep
+        }
+
+    logger.info("benchmark_complete", **summary)
     return result

@@ -134,9 +134,13 @@ async def test_seed_idempotent(clean_driver):
         cfg_result = await session.run("MATCH (c:Configuration) RETURN count(c) AS n")
         cfg_count = (await cfg_result.single())["n"]
 
-    assert gpu_count == 4, f"Expected 4 GPUModel nodes, got {gpu_count}"
+    from shittytoken.config import cfg as _cfg
+    expected_gpus = len(_cfg["gpus"]["catalog"])
+    assert gpu_count == expected_gpus, f"Expected {expected_gpus} GPUModel nodes, got {gpu_count}"
     assert llm_count == 1, f"Expected 1 LLMModel node, got {llm_count}"
-    assert cfg_count == 2, f"Expected 2 Configuration nodes, got {cfg_count}"
+    from shittytoken.config import preferred_gpus, serving_models
+    expected_cfgs = len(preferred_gpus()) * len(serving_models())
+    assert cfg_count == expected_cfgs, f"Expected {expected_cfgs} Configuration nodes, got {cfg_count}"
 
 
 # ---------------------------------------------------------------------------

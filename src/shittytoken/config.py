@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     gateway_admin_token: str = ""
 
     # SSH
-    ssh_private_key_path: str = "~/.ssh/id_rsa"
+    ssh_private_key_path: str = "~/.ssh/id_ed25519"
 
     class Config:
         env_file = ".env"
