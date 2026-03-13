@@ -91,7 +91,10 @@ class SSHManager:
                 f"SSHSession for {session.host}:{session.port} has no active connection"
             )
 
-        result = await session._conn.run(command, check=True)
+        # RunPod's SSH proxy requires a PTY allocation
+        result = await session._conn.run(
+            command, check=True, request_pty="auto",
+        )
         return result.stdout or "", result.stderr or ""
 
     async def verify_gpu(

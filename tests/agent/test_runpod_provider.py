@@ -3,11 +3,10 @@ Tests for RunPodProvider — spot instance provisioning on RunPod.
 
 Covers:
 - GPU offer mapping and filtering
-- Spot bid calculation
-- GraphQL mutation building
-- SSH port extraction from runtime ports
+- Spot price extraction
 - Spot eviction detection
 - Provider factory
+- Cross-provider scoring
 """
 
 from __future__ import annotations
@@ -266,61 +265,6 @@ class TestSpotPriceExtraction:
     def test_returns_none_when_both_missing(self):
         detail = _gpu_detail(community_spot=None, secure_spot=None)
         assert RunPodProvider._extract_spot_price(detail, "COMMUNITY") is None
-
-
-# ===================================================================
-# SSH port extraction
-# ===================================================================
-
-
-class TestSSHPortExtraction:
-    """_extract_ssh_from_ports parses RunPod runtime port mappings."""
-
-    def test_extracts_from_runtime_ports(self):
-        ports = [
-            {"privatePort": 8080, "publicPort": 18080, "ip": "1.2.3.4"},
-            {"privatePort": 22, "publicPort": 12345, "ip": "1.2.3.4"},
-        ]
-        host, port = RunPodProvider._extract_ssh_from_ports(ports, {})
-        assert host == "1.2.3.4"
-        assert port == 12345
-
-    def test_no_ssh_port_returns_none(self):
-        ports = [
-            {"privatePort": 8080, "publicPort": 18080, "ip": "1.2.3.4"},
-        ]
-        host, port = RunPodProvider._extract_ssh_from_ports(ports, {})
-        assert host is None
-        assert port == 22
-
-    def test_empty_ports_list(self):
-        host, port = RunPodProvider._extract_ssh_from_ports([], {})
-        assert host is None
-        assert port == 22
-
-    def test_fallback_to_machine_pod_host_id(self):
-        pod_info = {"machine": {"podHostId": "5.6.7.8"}}
-        host, port = RunPodProvider._extract_ssh_from_ports([], pod_info)
-        assert host == "5.6.7.8"
-        assert port == 22
-
-    def test_no_ip_in_port_entry(self):
-        ports = [{"privatePort": 22, "publicPort": 12345}]
-        host, port = RunPodProvider._extract_ssh_from_ports(ports, {})
-        assert host is None
-
-    def test_prefers_port_entry_over_fallback(self):
-        ports = [{"privatePort": 22, "publicPort": 12345, "ip": "1.2.3.4"}]
-        pod_info = {"machine": {"podHostId": "5.6.7.8"}}
-        host, port = RunPodProvider._extract_ssh_from_ports(ports, pod_info)
-        assert host == "1.2.3.4"
-        assert port == 12345
-
-    def test_machine_not_dict(self):
-        """Handles case where machine field is not a dict."""
-        pod_info = {"machine": "invalid"}
-        host, port = RunPodProvider._extract_ssh_from_ports([], pod_info)
-        assert host is None
 
 
 # ===================================================================

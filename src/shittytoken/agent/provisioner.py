@@ -65,6 +65,8 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
             "enable_prefix_caching must be True"
         )
 
+    worker_port = cfg.get("vllm", {}).get("worker_port", 8080)
+
     parts: list[str] = [
         "vllm",
         "serve",
@@ -75,8 +77,16 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
         "--max-num-seqs", str(config.max_num_seqs),
         "--enable-prefix-caching",
         "--host", "0.0.0.0",
-        "--port", "8080",
+        "--port", str(worker_port),
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", cfg.get("vllm", {}).get("tool_call_parser", "hermes"),
     ]
+
+    _vllm = cfg.get("vllm", {})
+    if _vllm.get("reasoning_parser"):
+        parts += ["--reasoning-parser", _vllm["reasoning_parser"]]
+    if _vllm.get("attention_backend"):
+        parts += ["--attention-backend", _vllm["attention_backend"]]
 
     if config.quantization is not None:
         parts += ["--quantization", config.quantization]
@@ -86,6 +96,11 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
 
     if config.enforce_eager:
         parts.append("--enforce-eager")
+
+    # Extra CLI args from config
+    extra_args = _vllm.get("extra_args", [])
+    if extra_args:
+        parts += [str(a) for a in extra_args]
 
     return " ".join(parts)
 
@@ -142,7 +157,7 @@ class GPUOffer:
 
 @dataclass
 class ProvisionedInstance:
-    """A running instance with SSH access."""
+    """A running instance with network access."""
 
     instance_id: str
     provider: str
@@ -150,6 +165,7 @@ class ProvisionedInstance:
     ssh_host: str
     ssh_port: int
     status: str
+    ssh_user: str = "root"  # RunPod uses {podHostId}@ssh.runpod.io
     http_port: int | None = None  # public port mapped to container 8080
 
 
@@ -385,12 +401,20 @@ class VastAIProvider(GPUProvider):
         offer: GPUOffer,
         vllm_command: str,
         hf_token: str,
-        disk_gb: int = 50,
+        disk_gb: int | None = None,
     ) -> ProvisionedInstance:
         """
         Rent an instance via the SDK and poll until SSH is ready.
         """
-        env_str = f"-e HF_TOKEN={hf_token}"
+        _vllm_cfg = cfg.get("vllm", {})
+        docker_image = _vllm_cfg.get("docker_image", "vllm/vllm-openai:latest")
+        if disk_gb is None:
+            disk_gb = _vllm_cfg.get("disk_gb", 50)
+
+        env_parts = [f"-e HF_TOKEN={hf_token}"]
+        for k, v in _vllm_cfg.get("env", {}).items():
+            env_parts.append(f"-e {k}={v}")
+        env_str = " ".join(env_parts)
 
         # Snapshot existing instance IDs so we can detect the new one
         existing_instances = await asyncio.to_thread(self._client.show_instances)
@@ -398,14 +422,22 @@ class VastAIProvider(GPUProvider):
         if isinstance(existing_instances, list):
             existing_ids = {inst.get("id") for inst in existing_instances}
 
+        # Prepend pip installs if configured
+        pre_install = _vllm_cfg.get("pre_install", [])
+        if pre_install:
+            pip_cmd = "pip install " + " ".join(pre_install)
+            startup_cmd = f"{pip_cmd} && {vllm_command}"
+        else:
+            startup_cmd = vllm_command
+
         result = await asyncio.to_thread(
             self._client.create_instance,
             id=int(offer.offer_id),
-            image="vllm/vllm-openai:latest",
+            image=docker_image,
             disk=disk_gb,
             ssh=True,
             direct=True,
-            onstart_cmd=vllm_command,
+            onstart_cmd=startup_cmd,
             env=env_str,
         )
 
@@ -447,8 +479,9 @@ class VastAIProvider(GPUProvider):
 
         logger.info("vastai_instance_created", instance_id=instance_id, offer_id=offer.offer_id)
 
-        # Poll until ssh_host is available (up to 10 minutes)
-        max_attempts = 120
+        # Poll until ssh_host is available
+        ssh_timeout_s = cfg.get("orchestrator", {}).get("ssh_ready_timeout_s", 600)
+        max_attempts = ssh_timeout_s // 5
         for attempt in range(max_attempts):
             await asyncio.sleep(5)
             info = await self.get_instance(instance_id)
@@ -654,16 +687,23 @@ class RunPodProvider(GPUProvider):
         offer: GPUOffer,
         vllm_command: str,
         hf_token: str,
-        disk_gb: int = 50,
+        disk_gb: int | None = None,
     ) -> ProvisionedInstance:
         """Create a spot pod via ``podRentInterruptable`` and wait for SSH."""
-        import json as _json
+        _vllm_cfg = cfg.get("vllm", {})
+        docker_image = _vllm_cfg.get("docker_image", "vllm/vllm-openai:latest")
+        if disk_gb is None:
+            disk_gb = _vllm_cfg.get("disk_gb", 50)
 
         cloud_type = offer.raw.get("cloud_type", "COMMUNITY")
         spot_price = offer.raw.get("spot_price_per_gpu") or 0
 
-        env_json = _json.dumps({"HF_TOKEN": hf_token, "VLLM_CMD": vllm_command})
+        # The vllm/vllm-openai image has ENTRYPOINT ["vllm", "serve"], so
+        # dockerArgs (which overrides CMD) must only contain the arguments
+        # after "vllm serve" to avoid doubling the command.
+        docker_args = vllm_command.removeprefix("vllm serve ")
 
+        # GraphQL env expects [{key, value}] objects, not a JSON string.
         mutation = f"""
         mutation {{
           podRentInterruptable(input: {{
@@ -672,14 +712,16 @@ class RunPodProvider(GPUProvider):
             gpuCount: {offer.num_gpus}
             gpuTypeId: "{offer.offer_id}"
             name: "shittytoken-worker"
-            imageName: "vllm/vllm-openai:latest"
+            imageName: "{docker_image}"
             containerDiskInGb: {disk_gb}
             volumeInGb: 0
             ports: "8080/http,22/tcp"
             startSsh: true
             supportPublicIp: true
-            dockerArgs: "{vllm_command}"
-            env: {env_json}
+            dockerArgs: "{docker_args}"
+            env: [
+              {{key: "HF_TOKEN", value: "{hf_token}"}}{self._build_env_entries(_vllm_cfg)}
+            ]
           }}) {{
             id
             imageName
@@ -706,35 +748,37 @@ class RunPodProvider(GPUProvider):
 
         logger.info("runpod_pod_created", pod_id=pod_id, offer_id=offer.offer_id)
 
-        # Poll until SSH is ready (up to 10 minutes)
-        max_attempts = 120
+        # Poll until pod is running with ports
+        ssh_timeout_s = cfg.get("orchestrator", {}).get("ssh_ready_timeout_s", 600)
+        max_attempts = ssh_timeout_s // 5
         for attempt in range(max_attempts):
             await asyncio.sleep(5)
             info = await self.get_instance(pod_id)
             status = info.get("desiredStatus", "")
-            runtime = info.get("runtime", {})
-            ports = runtime.get("ports", []) if runtime else []
+            runtime = info.get("runtime") or {}
+            ports = runtime.get("ports") or []
 
-            ssh_host, ssh_port = self._extract_ssh_from_ports(ports, info)
+            # SSH goes through RunPod's proxy: {podHostId}@ssh.runpod.io
+            machine = info.get("machine") or {}
+            pod_host_id = machine.get("podHostId")
 
             if attempt % 6 == 5:
                 logger.info(
-                    "runpod_waiting_for_ssh",
+                    "runpod_waiting_for_ready",
                     pod_id=pod_id,
                     attempt=attempt + 1,
                     elapsed_s=(attempt + 1) * 5,
                     status=status,
-                    ssh_host=ssh_host or "(not ready)",
+                    pod_host_id=pod_host_id or "(not ready)",
                 )
 
-            if ssh_host and status == "RUNNING":
-                # Extract HTTP port for vLLM (container port 8080)
+            if pod_host_id and ports and status == "RUNNING":
                 http_port = self._extract_http_port(ports)
                 logger.info(
                     "runpod_pod_ready",
                     pod_id=pod_id,
-                    ssh_host=ssh_host,
-                    ssh_port=ssh_port,
+                    ssh_user=pod_host_id,
+                    ssh_host="ssh.runpod.io",
                     http_port=http_port,
                     wait_s=(attempt + 1) * 5,
                 )
@@ -742,14 +786,15 @@ class RunPodProvider(GPUProvider):
                     instance_id=pod_id,
                     provider="runpod",
                     gpu_model=offer.gpu_name,
-                    ssh_host=ssh_host,
-                    ssh_port=ssh_port,
+                    ssh_host="ssh.runpod.io",
+                    ssh_port=22,
+                    ssh_user=pod_host_id,
                     http_port=http_port,
                     status="running",
                 )
 
         raise TimeoutError(
-            f"RunPod pod {pod_id} did not become SSH-ready within 600 s"
+            f"RunPod pod {pod_id} did not become ready within 600 s"
         )
 
     async def destroy_instance(self, instance_id: str) -> None:
@@ -758,16 +803,56 @@ class RunPodProvider(GPUProvider):
         logger.info("runpod_pod_destroyed", pod_id=instance_id)
 
     async def get_instance(self, instance_id: str) -> dict:
-        """Get pod details. Returns empty dict on failure."""
+        """Get pod details via GraphQL (includes machine.podHostId for SSH).
+
+        Returns empty dict on failure.
+        """
+        query = f"""
+        query {{
+          pod(input: {{podId: "{instance_id}"}}) {{
+            id
+            desiredStatus
+            podType
+            costPerHr
+            gpuCount
+            machineId
+            imageName
+            env
+            machine {{
+              podHostId
+              gpuDisplayName
+            }}
+            runtime {{
+              uptimeInSeconds
+              ports {{
+                ip
+                isIpPublic
+                privatePort
+                publicPort
+                type
+              }}
+            }}
+          }}
+        }}
+        """
         try:
-            result = await asyncio.to_thread(self._runpod.get_pod, instance_id)
-            if isinstance(result, dict):
-                return result
+            data = await self._async_graphql(query)
+            pod = data.get("pod")
+            if isinstance(pod, dict):
+                return pod
         except Exception as exc:
             logger.warning("runpod_get_pod_failed", pod_id=instance_id, error=str(exc))
         return {}
 
     # -- Helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _build_env_entries(vllm_cfg: dict) -> str:
+        """Build GraphQL env entries from config vllm.env dict."""
+        entries = ""
+        for k, v in vllm_cfg.get("env", {}).items():
+            entries += f', {{key: "{k}", value: "{v}"}}'
+        return entries
 
     @staticmethod
     def _extract_spot_price(detail: dict, cloud_type: str) -> float | None:
@@ -778,29 +863,6 @@ class RunPodProvider(GPUProvider):
             return detail.get("communitySpotPrice")
         # ALL — prefer community, fall back to secure
         return detail.get("communitySpotPrice") or detail.get("secureSpotPrice")
-
-    @staticmethod
-    def _extract_ssh_from_ports(
-        ports: list[dict],
-        pod_info: dict,
-    ) -> tuple[str | None, int]:
-        """Parse SSH host/port from RunPod pod runtime ports or pod-level fields.
-
-        RunPod exposes ports in ``runtime.ports`` as a list of dicts:
-        ``{"privatePort": 22, "publicPort": 12345, "ip": "x.x.x.x", ...}``
-
-        Falls back to pod-level ``machine.podHostId`` if ports list is empty.
-        """
-        for port_entry in ports:
-            if port_entry.get("privatePort") == 22:
-                ip = port_entry.get("ip")
-                public_port = port_entry.get("publicPort", 22)
-                if ip:
-                    return ip, int(public_port)
-
-        # Fallback: some pod responses have these at top level
-        ssh_host = pod_info.get("machine", {}).get("podHostId") if isinstance(pod_info.get("machine"), dict) else None
-        return ssh_host, 22
 
     @staticmethod
     def _extract_http_port(ports: list[dict]) -> int | None:
@@ -858,6 +920,20 @@ def get_provider(
 # ---------------------------------------------------------------------------
 # Provider-agnostic entry points
 # ---------------------------------------------------------------------------
+
+
+def build_worker_url(record) -> str:
+    """Build the HTTP URL to reach the vLLM server on a provisioned instance.
+
+    Provider-specific logic:
+    - RunPod: HTTPS proxy URL based on pod ID and worker port
+    - Vast.ai / default: direct HTTP to ssh_host on the http_port
+    """
+    worker_port = cfg.get("vllm", {}).get("worker_port", 8080)
+    if record.provider == "runpod":
+        return f"https://{record.instance_id}-{worker_port}.proxy.runpod.net"
+    http_port = record.http_port or worker_port
+    return f"http://{record.ssh_host}:{http_port}"
 
 
 async def build_deployment_plan(

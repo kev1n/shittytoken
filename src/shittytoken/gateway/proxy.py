@@ -26,6 +26,26 @@ logger = structlog.get_logger()
 
 _UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=10)
 
+UsageCallback = Callable[[int, int], Awaitable[None]] | Callable[[int, int], None] | None
+
+
+async def _record_usage(
+    prompt_tokens: int,
+    completion_tokens: int,
+    on_usage: UsageCallback,
+) -> None:
+    """Record token metrics and invoke the billing callback (if any)."""
+    if not (prompt_tokens or completion_tokens):
+        return
+    prom_metrics.add_tokens(prompt_tokens, completion_tokens)
+    if on_usage is not None:
+        try:
+            result = on_usage(prompt_tokens, completion_tokens)
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            logger.warning("proxy.on_usage_callback_error", exc_info=True)
+
 
 async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     """Proxy POST /v1/chat/completions with SSE streaming."""
@@ -43,8 +63,15 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             status=400,
         )
 
+    # Normalize message roles — some SDKs (agno) send "developer" which
+    # vLLM doesn't understand.  Rewrite to "system".
+    messages = body.get("messages", [])
+    for msg in messages:
+        if msg.get("role") == "developer":
+            msg["role"] = "system"
+
     # Build per-request usage callback from billing pipeline.
-    on_usage: Callable[[int, int], Awaitable[None]] | Callable[[int, int], None] | None = None
+    on_usage: UsageCallback = None
     pipeline = request.app.get("billing_pipeline")
     user_id: str | None = request.get("user_id")
     key_hash: str | None = request.get("key_hash")
@@ -74,13 +101,13 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     prom_metrics.inc_active()
 
     # ---- routing ---------------------------------------------------------
-    messages = body.get("messages", [])
     prefix_key = request.headers.get("X-Session-ID")
     if prefix_key is None:
         prefix_key = policy.compute_prefix_key(messages)
 
     worker = pool.select(prefix_key)
     if worker is None:
+        prom_metrics.dec_active()
         logger.error("proxy.no_workers")
         return web.json_response(
             {"error": {"message": "No healthy workers available"}},
@@ -89,8 +116,10 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
 
     # ---- prepare upstream request ----------------------------------------
     upstream_body = dict(body)
-    upstream_body["stream"] = True
-    upstream_body.setdefault("stream_options", {})["include_usage"] = True
+    client_streaming = body.get("stream", False)
+    if client_streaming:
+        upstream_body["stream"] = True
+        upstream_body.setdefault("stream_options", {})["include_usage"] = True
 
     upstream_url = f"{worker.url.rstrip('/')}/v1/chat/completions"
 
@@ -102,6 +131,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             timeout=_UPSTREAM_TIMEOUT,
         )
     except (aiohttp.ClientError, TimeoutError) as exc:
+        prom_metrics.dec_active()
         logger.error("proxy.upstream_connect_error", worker=worker.url, error=str(exc))
         return web.json_response(
             {"error": {"message": "Upstream worker unavailable"}},
@@ -117,10 +147,33 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             body=error_body[:500],
         )
         upstream_resp.release()
+        prom_metrics.dec_active()
         return web.Response(
             text=error_body,
             status=upstream_resp.status,
             content_type=upstream_resp.content_type or "application/json",
+        )
+
+    # ---- non-streaming: return JSON response directly --------------------
+    if not client_streaming:
+        resp_body = await upstream_resp.text()
+        upstream_resp.release()
+        prom_metrics.dec_active()
+        prom_metrics.inc_request("POST", 200)
+        try:
+            resp_json = json.loads(resp_body)
+            usage = resp_json.get("usage", {})
+            await _record_usage(
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                on_usage,
+            )
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return web.Response(
+            text=resp_body,
+            status=200,
+            content_type="application/json",
         )
 
     # ---- stream SSE back to client ---------------------------------------
@@ -175,6 +228,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         # Close client connection on mid-stream failure.
         await response.write_eof()
         upstream_resp.release()
+        prom_metrics.dec_active()
         return response
 
     upstream_resp.release()
@@ -182,16 +236,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     # ---- metrics & billing ------------------------------------------------
     prom_metrics.dec_active()
     prom_metrics.inc_request("POST", 200)
-    if prompt_tokens or completion_tokens:
-        prom_metrics.add_tokens(prompt_tokens, completion_tokens)
-
-    if on_usage is not None and (prompt_tokens or completion_tokens):
-        try:
-            result = on_usage(prompt_tokens, completion_tokens)
-            if hasattr(result, "__await__"):
-                await result
-        except Exception:
-            logger.warning("proxy.on_usage_callback_error", exc_info=True)
+    await _record_usage(prompt_tokens, completion_tokens, on_usage)
 
     await response.write_eof()
     return response

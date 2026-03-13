@@ -30,30 +30,59 @@ gpus:
       memory_bandwidth_gbs: 3350
 
   # GPUs to search for when provisioning spot instances
-  preferred: ["L40S"]
+  preferred: ["RTX 3090"]
 
   # Minimum requirements for offer filtering
-  min_gpu_total_ram_gb: 48
+  min_gpu_total_ram_gb: 24
   min_inet_up_mbps: 100.0
   min_pcie_bw_gbps: 5.0
-  min_reliability: 0.99
-  min_gpus: 1
+  min_reliability: 0.95
+  min_gpus: 2
 
 # ── vLLM defaults ──────────────────────────────────────────────────────────
 # Initial configuration seeded into the knowledge graph per GPU.
 # The agent may propose different values via OOM recovery or LLM config proposal.
 vllm:
   defaults:
-    tensor_parallel_size: 1
-    max_model_len: 131072
-    gpu_memory_utilization: 0.90
-    quantization: null  # let vLLM auto-detect from model config
-    kv_cache_dtype: "auto"
-    max_num_seqs: 64
+    tensor_parallel_size: 2
+    max_model_len: 200000
+    gpu_memory_utilization: 0.92
+    quantization: null # let vLLM auto-detect from model config
+    kv_cache_dtype: "fp8_e4m3"
+    max_num_seqs: 16
     enable_prefix_caching: true
-    enforce_eager: false
 
-  worker_port: 8000
+  worker_port: 8080
+  docker_image: "vllm/vllm-openai:latest"
+  disk_gb: 50
+  tool_call_parser: "qwen3_coder"
+  reasoning_parser: "qwen3"
+  attention_backend: "FLASHINFER"
+
+  # pip packages to install before starting vLLM
+  pre_install:
+    - "fastsafetensors"
+
+  # Extra CLI flags passed directly to vllm serve
+  extra_args:
+    - "--load-format"
+    - "fastsafetensors"
+    - "--max-num-batched-tokens"
+    - "8192"
+    - "--optimization-level"
+    - "3"
+    - "--performance-mode"
+    - "throughput"
+    - "--mamba-cache-mode"
+    - "align"
+    - "--mamba-block-size"
+    - "8"
+
+  # Environment variables set on the container
+  env:
+    VLLM_USE_DEEP_GEMM: "0"
+    VLLM_USE_FLASHINFER_MOE_FP16: "1"
+    VLLM_USE_FLASHINFER_SAMPLER: "0"
 
 # ── Gateway ─────────────────────────────────────────────────────────────────
 gateway:
@@ -69,7 +98,7 @@ gateway:
     send_timeout_sec: 120
 
   auth:
-    enabled: false          # toggle for dev/testing
+    enabled: false # toggle for dev/testing
     rate_limit_default_rpm: 60
     rate_limit_default_tpm: 100000
 
@@ -86,7 +115,7 @@ gateway:
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 orchestrator:
-  provider: runpod  # vastai | runpod
+  provider: vastai # vastai | runpod
   min_workers: 1
   scale_up_waiting_threshold: 10
   scale_down_idle_seconds: 300
@@ -94,10 +123,12 @@ orchestrator:
   metrics_poll_interval_s: 10
   health_check_interval_s: 30
   startup_monitor_timeout_s: 1200
+  provision_cooldown_s: 60
+  ssh_ready_timeout_s: 600 # max time to wait for SSH after renting
 
   # RunPod-specific settings (spot only)
   runpod:
-    cloud_type: SECURE  # COMMUNITY | SECURE | ALL
+    cloud_type: SECURE # COMMUNITY | SECURE | ALL
     spot_poll_interval_sec: 10
 
 # ── SSH ─────────────────────────────────────────────────────────────────────
@@ -125,7 +156,7 @@ benchmark:
     enabled: true
     context_steps_tokens: [8192, 16384, 32768, 65536, 131072]
     output_tokens_per_step: 512
-    request_timeout_sec: 300.0  # long-context needs more time
+    request_timeout_sec: 300.0 # long-context needs more time
 
   # Timeouts
   request_timeout_sec: 120.0

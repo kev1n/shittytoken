@@ -51,6 +51,7 @@ class InstanceRecord:
     gpu_model: str
     ssh_host: str = ""
     ssh_port: int = 22
+    ssh_user: str = "root"  # RunPod uses {podHostId}@ssh.runpod.io
     http_port: int | None = None  # public port mapped to container 8080
     worker_url: str = ""
     state: InstanceState = InstanceState.PROVISIONING
