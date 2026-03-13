@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     # Gateway
     gateway_admin_token: str = ""
 
+    # Stripe (billing)
+    stripe_secret_key: str = ""
+
     # SSH
     ssh_private_key_path: str = "~/.ssh/id_ed25519"
 

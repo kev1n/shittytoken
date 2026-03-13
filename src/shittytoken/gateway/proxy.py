@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from shittytoken.gateway.worker_pool import WorkerPool
 
 from shittytoken.gateway.routing_policy import CacheAwarePolicy
+from shittytoken.gateway import prom_metrics
 
 logger = structlog.get_logger()
 
@@ -31,9 +32,6 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     pool: WorkerPool = request.app["worker_pool"]
     session: aiohttp.ClientSession = request.app["upstream_session"]
     policy: CacheAwarePolicy = request.app["routing_policy"]
-    on_usage: Callable[[int, int], Awaitable[None]] | Callable[[int, int], None] | None = (
-        request.app.get("on_usage")
-    )
 
     # ---- read client body ------------------------------------------------
     try:
@@ -44,6 +42,19 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             {"error": {"message": "Request body must be valid JSON"}},
             status=400,
         )
+
+    # Build per-request usage callback from billing manager if auth is active.
+    on_usage: Callable[[int, int], Awaitable[None]] | Callable[[int, int], None] | None = None
+    billing_mgr = request.app.get("billing_manager")
+    user_id: str | None = request.get("user_id")
+    key_hash: str | None = request.get("key_hash")
+    if billing_mgr is not None and user_id is not None and key_hash is not None:
+        model_id = body.get("model", "unknown")
+        on_usage = billing_mgr.on_usage_callback(user_id, key_hash, model_id)
+    else:
+        on_usage = request.app.get("on_usage")
+
+    prom_metrics.inc_active()
 
     # ---- routing ---------------------------------------------------------
     messages = body.get("messages", [])
@@ -151,7 +162,12 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
 
     upstream_resp.release()
 
-    # ---- fire usage callback ---------------------------------------------
+    # ---- metrics & billing ------------------------------------------------
+    prom_metrics.dec_active()
+    prom_metrics.inc_request("POST", 200)
+    if prompt_tokens or completion_tokens:
+        prom_metrics.add_tokens(prompt_tokens, completion_tokens)
+
     if on_usage is not None and (prompt_tokens or completion_tokens):
         try:
             result = on_usage(prompt_tokens, completion_tokens)

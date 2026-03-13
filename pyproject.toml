@@ -23,9 +23,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+billing = [
+    "stripe>=8.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-aiohttp>=1.0",
     "pytest-mock>=3.12",
     "testcontainers[neo4j]>=4.0",
     "aiohttp[speedups]>=3.9",
