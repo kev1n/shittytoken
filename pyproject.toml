@@ -17,6 +17,9 @@ dependencies = [
     "structlog>=24.1",
     "pyyaml>=6.0",
     "vastai-sdk>=0.5",
+    "runpod>=1.8.1",
+    "requests>=2.32.5",
+    "aiosqlite>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +33,7 @@ dev = [
 
 [project.scripts]
 shittytoken = "shittytoken.__main__:cli"
+shittytoken-router = "shittytoken.gateway.router:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/shittytoken"]

@@ -36,9 +36,11 @@ from .metrics import AggregateMetrics, aggregate_metrics, scrape_worker_metrics
 from .provisioner import (
     DeploymentPlan,
     GPUProvider,
+    RunPodProvider,
     VastAIProvider,
     build_deployment_plan,
     execute_deployment,
+    get_provider,
 )
 from .ssh import SSHManager
 from .startup_monitor import StartupResult, monitor_startup
@@ -81,9 +83,12 @@ class Orchestrator:
         self._provision_lock = asyncio.Lock()
         self._shutdown_event = asyncio.Event()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._provider: Optional[GPUProvider] = None
         self._ssh_manager: Optional[SSHManager] = None
         self._heartbeat_monitor: Optional[HeartbeatMonitor] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._spot_monitor_task: Optional[asyncio.Task] = None
+        self._provision_cooldown_until: float = 0.0  # monotonic time
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -102,6 +107,14 @@ class Orchestrator:
             on_failure=self._on_worker_failure,
         )
         self._heartbeat_task = asyncio.create_task(self._heartbeat_monitor.run())
+
+        # Start spot eviction monitor for RunPod instances
+        provider_name = cfg["orchestrator"].get("provider", "vastai")
+        if provider_name == "runpod":
+            poll_sec = cfg["orchestrator"].get("runpod", {}).get("spot_poll_interval_sec", 10)
+            self._spot_monitor_task = asyncio.create_task(
+                self._spot_eviction_monitor(poll_sec)
+            )
 
         # Install SIGTERM handler
         loop = asyncio.get_running_loop()
@@ -141,8 +154,21 @@ class Orchestrator:
         provisioning = self._provision_lock.locked()
 
         if not serving_urls:
-            logger.info("orchestrator_tick", serving_workers=0)
-            if not provisioning:
+            # Log all instance states for monitoring
+            states = {}
+            for sm in self._instances.values():
+                s = sm.state.value
+                states[s] = states.get(s, 0) + 1
+            logger.info(
+                "orchestrator_tick",
+                serving_workers=0,
+                instances=states if states else None,
+            )
+            now = time.monotonic()
+            if now < self._provision_cooldown_until:
+                remaining = round(self._provision_cooldown_until - now)
+                logger.info("provision_cooldown", remaining_s=remaining)
+            elif not provisioning:
                 logger.info("min_workers_provision", min_workers=min_workers)
                 asyncio.create_task(self._guarded_provision())
             return
@@ -198,7 +224,24 @@ class Orchestrator:
     async def _guarded_provision(self) -> None:
         """Serialize provisioning so only one scale-up runs at a time."""
         async with self._provision_lock:
-            await self.provision_and_qualify()
+            try:
+                result = await self.provision_and_qualify()
+                if result is None:
+                    # Provision failed gracefully — cooldown before retrying
+                    self._provision_cooldown_until = time.monotonic() + 60
+                    logger.info("provision_failed_cooldown", cooldown_s=60)
+            except Exception as exc:
+                logger.error(
+                    "provision_unhandled_exception",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                self._provision_cooldown_until = time.monotonic() + 60
+                # Clean up any instance that was created but not fully serving
+                for sm in list(self._instances.values()):
+                    if sm.state in (InstanceState.PROVISIONING, InstanceState.BENCHMARKING):
+                        logger.info("provision_cleanup_orphan", instance_id=sm.record.instance_id, state=sm.state.value)
+                        await self._destroy_instance(sm.record, sm)
 
     async def _maybe_scale_down(self, metrics: AggregateMetrics) -> None:
         """Scale down if a worker has been idle long enough and KV cache is low."""
@@ -256,14 +299,20 @@ class Orchestrator:
 
         settings = self._settings
 
-        # Look up the best known configuration for the first GPU type
+        # Look up the best known configuration for ANY preferred GPU type
         # Priority: benchmarked passing config > any seeded config > LLM proposal
         config_source = "knowledge_graph_benchmarked"
-        config = await self._kg.best_config_for(gpu_names[0], model_id)
+        config = None
+        for gpu_name in gpu_names:
+            config = await self._kg.best_config_for(gpu_name, model_id)
+            if config is not None:
+                break
         if config is None:
-            # Fallback: use any config linked to this GPU+model (e.g. seeded)
-            config = await self._kg.any_config_for(gpu_names[0], model_id)
             config_source = "knowledge_graph_seed"
+            for gpu_name in gpu_names:
+                config = await self._kg.any_config_for(gpu_name, model_id)
+                if config is not None:
+                    break
         if config is None:
             # Last resort: ask the LLM to propose a config
             logger.info(
@@ -283,9 +332,10 @@ class Orchestrator:
                 )
                 return None
 
-        provider = VastAIProvider(settings.vastai_api_key, self._session)
+        provider = self._get_provider()
 
-        # --- Step 1a: Build deployment plan (searches offers, no spend) ---
+        # --- Step 1/7: Build deployment plan (searches offers, no spend) ---
+        logger.info("provision_step", step="1/7", action="searching_offers", gpu_names=gpu_names)
         try:
             plan = await build_deployment_plan(
                 provider=provider,
@@ -298,14 +348,16 @@ class Orchestrator:
             logger.error("provision_plan_failed", error=str(exc))
             return None
 
-        # --- Step 1b: HITL approval gate ---
+        # --- Step 2/7: HITL approval gate ---
+        logger.info("provision_step", step="2/7", action="awaiting_approval", offer_id=plan.offer.offer_id, gpu=f"{plan.offer.num_gpus}x {plan.offer.gpu_name}", cost=f"${plan.offer.cost_per_hour_usd:.4f}/hr")
         if self._approval_fn is not None:
             approved = await self._approval_fn(plan)
             if not approved:
                 logger.info("provision_rejected_by_user", provider=plan.provider)
                 return None
 
-        # --- Step 1c: Execute the approved plan (rents the instance) ---
+        # --- Step 3/7: Execute the approved plan (rents the instance) ---
+        logger.info("provision_step", step="3/7", action="renting_instance", offer_id=plan.offer.offer_id)
         try:
             provisioned = await execute_deployment(
                 plan=plan,
@@ -322,12 +374,14 @@ class Orchestrator:
             gpu_model=provisioned.gpu_model,
             ssh_host=provisioned.ssh_host,
             ssh_port=provisioned.ssh_port,
+            http_port=provisioned.http_port,
             config_id=config.config_id,
         )
         sm = InstanceStateMachine(record)
         self._instances[record.instance_id] = sm
 
-        # --- Step 2: Verify GPU via SSH ---
+        # --- Step 4/7: Verify GPU via SSH ---
+        logger.info("provision_step", step="4/7", action="verifying_gpu", instance_id=record.instance_id, ssh_host=record.ssh_host)
         import asyncssh  # avoid circular; only needed here
 
         try:
@@ -335,22 +389,24 @@ class Orchestrator:
                 host=record.ssh_host,
                 port=record.ssh_port,
             )
-        except asyncssh.Error as exc:
+        except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
             logger.error(
                 "provision_ssh_connect_failed",
                 instance_id=record.instance_id,
                 error=str(exc),
+                error_type=type(exc).__name__,
             )
             sm.transition(InstanceState.FAILED, reason="ssh_connect_failed")
             await self._destroy_instance(record, sm)
             return None
 
-        # GPU verification uses first GPU name as expected model
-        expected_vram_gb = await self._kg.gpu_vram_for(gpu_names[0])
+        # GPU verification uses the ACTUAL provisioned GPU, not the first preferred
+        actual_gpu = record.gpu_model  # e.g. "RTX 4090" from the provisioner
+        expected_vram_gb = await self._kg.gpu_vram_for(actual_gpu)
         if expected_vram_gb is None:
             logger.error(
                 "provision_gpu_vram_unknown",
-                gpu_name=gpu_names[0],
+                gpu_name=actual_gpu,
             )
             sm.transition(InstanceState.FAILED, reason="gpu_vram_unknown")
             await self._ssh_manager.close(session)
@@ -359,7 +415,7 @@ class Orchestrator:
 
         gpu_ok = await self._ssh_manager.verify_gpu(
             session=session,
-            expected_gpu_name=gpu_names[0],
+            expected_gpu_name=actual_gpu,
             expected_vram_gb=expected_vram_gb,
         )
         if not gpu_ok:
@@ -372,7 +428,8 @@ class Orchestrator:
         # --- Transition to BENCHMARKING ---
         sm.transition(InstanceState.BENCHMARKING, reason="gpu_verified")
 
-        # --- Step 3: Monitor startup ---
+        # --- Step 5/7: Monitor startup (may take several minutes for model download + load) ---
+        logger.info("provision_step", step="5/7", action="monitoring_startup", instance_id=record.instance_id, msg="streaming VM logs — model download + weight loading can take several minutes")
         log_lines: asyncio.Queue[str] = asyncio.Queue()
 
         async def _enqueue(line: str) -> None:
@@ -417,9 +474,9 @@ class Orchestrator:
             await self._destroy_instance(record, sm)
             return None
 
-        # --- Step 4: Wait for model ready via HTTP ---
-        worker_port = cfg["vllm"]["worker_port"]
-        worker_url = f"http://{record.ssh_host}:{worker_port}"
+        # --- Step 6/7: Wait for model ready via HTTP ---
+        logger.info("provision_step", step="6/7", action="waiting_for_model_ready", instance_id=record.instance_id)
+        worker_url = self._build_worker_url(record)
         record.worker_url = worker_url
 
         model_ready = await wait_for_model_ready(
@@ -433,7 +490,8 @@ class Orchestrator:
             await self._destroy_instance(record, sm)
             return None
 
-        # --- Step 5: Run benchmark ---
+        # --- Step 7/7: Run benchmark ---
+        logger.info("provision_step", step="7/7", action="running_benchmark", instance_id=record.instance_id, worker_url=worker_url)
         try:
             from ..benchmark.runner import run_benchmark  # type: ignore[import]
 
@@ -493,7 +551,16 @@ class Orchestrator:
             return None
 
         # --- Step 6: Register with gateway and transition to SERVING ---
-        await self._gateway.register_worker(worker_url)
+        try:
+            await self._gateway.register_worker(worker_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "gateway_register_failed",
+                instance_id=record.instance_id,
+                error=str(exc),
+                msg="Worker passed benchmark but gateway registration failed. "
+                    "Worker is still reachable directly at worker_url.",
+            )
         self._heartbeat_monitor.register(worker_url)
         sm.transition(InstanceState.SERVING, reason="benchmark_passed")
 
@@ -601,6 +668,12 @@ class Orchestrator:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+        if self._spot_monitor_task is not None:
+            self._spot_monitor_task.cancel()
+            try:
+                await self._spot_monitor_task
+            except asyncio.CancelledError:
+                pass
         if self._session is not None:
             await self._session.close()
         await self._kg.close()
@@ -668,8 +741,76 @@ class Orchestrator:
         return config
 
     def _get_provider(self) -> GPUProvider:
-        """Return the GPU provider instance."""
-        return VastAIProvider(self._settings.vastai_api_key, self._session)
+        """Return the cached GPU provider instance."""
+        if self._provider is None:
+            provider_name = cfg["orchestrator"].get("provider", "vastai")
+            self._provider = get_provider(
+                provider_name=provider_name,
+                vastai_api_key=self._settings.vastai_api_key,
+                runpod_api_key=self._settings.runpod_api_key,
+                session=self._session,
+            )
+        return self._provider
+
+    @staticmethod
+    def _build_worker_url(record: InstanceRecord) -> str:
+        """Build the HTTP URL to reach the vLLM server on a provisioned instance."""
+        http_port = record.http_port or 8080
+        return f"http://{record.ssh_host}:{http_port}"
+
+    async def _spot_eviction_monitor(self, poll_interval_sec: int = 10) -> None:
+        """Background task that polls RunPod pod status to detect spot evictions.
+
+        RunPod spot instances get SIGTERM with only 5s grace — no advance
+        warning.  This monitor detects eviction by checking if the pod
+        status transitioned to EXITED while podType is INTERRUPTABLE.
+        """
+        logger.info("spot_eviction_monitor_started", poll_interval_sec=poll_interval_sec)
+        provider = self._get_provider()
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(poll_interval_sec)
+
+                for sm in list(self._instances.values()):
+                    if sm.record.provider != "runpod":
+                        continue
+                    if sm.state not in (InstanceState.SERVING, InstanceState.BENCHMARKING):
+                        continue
+
+                    pod_info = await provider.get_instance(sm.record.instance_id)
+                    if not pod_info:
+                        continue
+
+                    if RunPodProvider.is_spot_eviction(pod_info):
+                        logger.warning(
+                            "spot_eviction_detected",
+                            instance_id=sm.record.instance_id,
+                            gpu_model=sm.record.gpu_model,
+                        )
+                        if sm.state == InstanceState.SERVING and sm.record.worker_url:
+                            self._heartbeat_monitor.deregister(sm.record.worker_url)
+                            try:
+                                await self._gateway.deregister_worker(
+                                    sm.record.worker_url, drain=False
+                                )
+                            except KeyError:
+                                pass
+
+                        sm.transition(InstanceState.FAILED, reason="spot_eviction")
+                        self._instances.pop(sm.record.instance_id, None)
+                        self._idle_since.pop(sm.record.instance_id, None)
+                        self._last_running.pop(sm.record.instance_id, None)
+
+                        if not self._provision_lock.locked():
+                            logger.info("spot_eviction_reprovision", instance_id=sm.record.instance_id)
+                            asyncio.create_task(self._guarded_provision())
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("spot_eviction_monitor_error", error=str(exc))
+
+        logger.info("spot_eviction_monitor_stopped")
 
     async def _destroy_instance(
         self,

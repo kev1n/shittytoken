@@ -11,11 +11,11 @@ INVARIANTS (enforced by build_vllm_command):
 
 Always injected:
 - --enable-prefix-caching
-- --ipc=host  (required for tensor parallelism)
+- --host 0.0.0.0 --port 8080  (listen on all interfaces, tunnel port)
 
 Provider abstraction:
 - GPUProvider is the abstract interface
-- VastAIProvider is the sole implementation for now
+- VastAIProvider and RunPodProvider are the implementations
 - Adding a new provider means subclassing GPUProvider
 """
 
@@ -48,7 +48,11 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
     - config.gpu_memory_utilization < 1.0
     - config.enable_prefix_caching is True
 
-    Always injects --enable-prefix-caching and --ipc=host.
+    Always injects --enable-prefix-caching.
+
+    NOTE: --ipc=host is a Docker runtime flag, NOT a vLLM CLI flag.
+    It must be passed to the container runtime (e.g. docker run --ipc=host).
+    On Vast.ai, the container is already started with appropriate IPC settings.
     """
     if config.gpu_memory_utilization >= 1.0:
         raise ValueError(
@@ -70,7 +74,8 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
         "--gpu-memory-utilization", str(config.gpu_memory_utilization),
         "--max-num-seqs", str(config.max_num_seqs),
         "--enable-prefix-caching",
-        "--ipc=host",
+        "--host", "0.0.0.0",
+        "--port", "8080",
     ]
 
     if config.quantization is not None:
@@ -145,6 +150,7 @@ class ProvisionedInstance:
     ssh_host: str
     ssh_port: int
     status: str
+    http_port: int | None = None  # public port mapped to container 8080
 
 
 @dataclass
@@ -386,6 +392,12 @@ class VastAIProvider(GPUProvider):
         """
         env_str = f"-e HF_TOKEN={hf_token}"
 
+        # Snapshot existing instance IDs so we can detect the new one
+        existing_instances = await asyncio.to_thread(self._client.show_instances)
+        existing_ids = set()
+        if isinstance(existing_instances, list):
+            existing_ids = {inst.get("id") for inst in existing_instances}
+
         result = await asyncio.to_thread(
             self._client.create_instance,
             id=int(offer.offer_id),
@@ -399,37 +411,71 @@ class VastAIProvider(GPUProvider):
 
         logger.debug("vastai_create_instance_response", result=repr(result)[:500])
 
-        # SDK may return dict, string, int, or None depending on version
+        # SDK create_instance often returns None even on success.
+        # Detect the new instance by diffing show_instances before/after.
+        instance_id: str | None = None
+
         if isinstance(result, dict):
             instance_id = str(result.get("new_contract", result.get("id", "")))
-        elif result is not None:
-            # Sometimes returns just the instance ID as a string or int
-            instance_id = str(result)
-        else:
-            # None response — the instance was likely created but SDK didn't
-            # return the ID. Fall back to the offer ID and hope for the best.
-            logger.warning(
-                "vastai_create_returned_none",
-                offer_id=offer.offer_id,
-                msg="SDK returned None — using offer_id as instance_id fallback",
+        elif result is not None and str(result).strip():
+            instance_id = str(result).strip()
+
+        if not instance_id:
+            # Poll show_instances to find the newly created instance
+            for _poll in range(6):
+                await asyncio.sleep(2)
+                current = await asyncio.to_thread(self._client.show_instances)
+                if isinstance(current, list):
+                    new_instances = [
+                        inst for inst in current
+                        if inst.get("id") not in existing_ids
+                    ]
+                    if new_instances:
+                        instance_id = str(new_instances[0]["id"])
+                        logger.info(
+                            "vastai_instance_discovered",
+                            instance_id=instance_id,
+                            method="show_instances_diff",
+                        )
+                        break
+
+        if not instance_id:
+            raise RuntimeError(
+                f"Vast.ai create_instance returned no ID and could not find "
+                f"new instance via show_instances (offer_id={offer.offer_id})"
             )
-            instance_id = str(offer.offer_id)
+
         logger.info("vastai_instance_created", instance_id=instance_id, offer_id=offer.offer_id)
 
         # Poll until ssh_host is available (up to 10 minutes)
-        for attempt in range(120):
+        max_attempts = 120
+        for attempt in range(max_attempts):
             await asyncio.sleep(5)
             info = await self.get_instance(instance_id)
             ssh_host = info.get("ssh_host", "")
             ssh_port = int(info.get("ssh_port", 22))
             status = info.get("actual_status", "unknown")
-            if ssh_host:
+
+            # Log progress every 30s (6 attempts)
+            if attempt % 6 == 5:
+                logger.info(
+                    "vastai_waiting_for_ssh",
+                    instance_id=instance_id,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    elapsed_s=(attempt + 1) * 5,
+                    status=status,
+                    ssh_host=ssh_host or "(not ready)",
+                )
+
+            if ssh_host and status == "running":
                 logger.info(
                     "vastai_instance_ready",
                     instance_id=instance_id,
                     ssh_host=ssh_host,
                     ssh_port=ssh_port,
-                    attempts=attempt + 1,
+                    status=status,
+                    wait_s=(attempt + 1) * 5,
                 )
                 return ProvisionedInstance(
                     instance_id=instance_id,
@@ -437,6 +483,7 @@ class VastAIProvider(GPUProvider):
                     gpu_model=info.get("gpu_name", offer.gpu_name),
                     ssh_host=ssh_host,
                     ssh_port=ssh_port,
+                    http_port=ssh_port + 1,  # Vast.ai tunnel convention
                     status=status,
                 )
 
@@ -451,11 +498,19 @@ class VastAIProvider(GPUProvider):
 
     async def get_instance(self, instance_id: str) -> dict:
         """Get instance details via the SDK."""
+        # show_instance(id=) can return None with raw=True, so fall back
+        # to filtering show_instances() by ID.
         result = await asyncio.to_thread(
             self._client.show_instance, id=int(instance_id)
         )
         if isinstance(result, dict):
             return result
+        # Fallback: search in show_instances list
+        instances = await asyncio.to_thread(self._client.show_instances)
+        if isinstance(instances, list):
+            for inst in instances:
+                if str(inst.get("id")) == str(instance_id):
+                    return inst
         return {}
 
     @staticmethod
@@ -477,6 +532,327 @@ class VastAIProvider(GPUProvider):
             dlperf=raw.get("dlperf"),
             raw=raw,
         )
+
+
+# ---------------------------------------------------------------------------
+# RunPod provider (spot-only via GraphQL)
+# ---------------------------------------------------------------------------
+
+
+class RunPodProvider(GPUProvider):
+    """Provisions and manages spot GPU pods on RunPod.
+
+    Uses the ``runpod`` SDK for queries and direct GraphQL mutations for
+    spot-specific operations (``podRentInterruptable``, ``podBidResume``)
+    which are not exposed by the SDK's convenience functions.
+
+    All pods are created as **spot (interruptable)** instances.  Spot
+    eviction delivers SIGTERM with a 5-second grace period and no advance
+    warning — the caller must poll pod status externally to detect eviction.
+    """
+
+    def __init__(self, api_key: str, session: aiohttp.ClientSession | None = None) -> None:
+        import runpod
+
+        self._api_key = api_key
+        runpod.api_key = api_key
+        self._runpod = runpod
+
+    @property
+    def name(self) -> str:
+        return "runpod"
+
+    # -- GraphQL helpers -----------------------------------------------------
+
+    def _graphql_query(self, query: str) -> dict[str, Any]:
+        """Execute a raw GraphQL query/mutation against the RunPod API."""
+        import requests
+
+        resp = requests.post(
+            "https://api.runpod.io/graphql",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            json={"query": query},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "errors" in data:
+            raise RuntimeError(f"RunPod GraphQL error: {data['errors']}")
+        return data.get("data", {})
+
+    async def _async_graphql(self, query: str) -> dict[str, Any]:
+        """Run a GraphQL query in a thread (the SDK is synchronous)."""
+        return await asyncio.to_thread(self._graphql_query, query)
+
+    # -- GPUProvider interface -----------------------------------------------
+
+    async def find_offers(
+        self,
+        gpu_names: list[str],
+        min_gpus: int = 2,
+    ) -> list[GPUOffer]:
+        """Query RunPod GPU types and return spot offers sorted by score."""
+        _gpu_cfg = cfg["gpus"]
+        runpod_cfg = cfg.get("orchestrator", {}).get("runpod", {})
+        cloud_type = runpod_cfg.get("cloud_type", "COMMUNITY")
+
+        all_gpus = await asyncio.to_thread(self._runpod.get_gpus)
+
+        gpu_names_lower = {n.lower() for n in gpu_names}
+        offers: list[GPUOffer] = []
+
+        for gpu in all_gpus:
+            display_name = gpu.get("displayName", "")
+            if display_name.lower() not in gpu_names_lower:
+                continue
+
+            gpu_id = gpu.get("id", display_name)
+            detail = await asyncio.to_thread(
+                self._runpod.get_gpu, gpu_id, min_gpus
+            )
+
+            spot_price = self._extract_spot_price(detail, cloud_type)
+            if spot_price is None or spot_price <= 0:
+                continue
+
+            min_vram = _gpu_cfg.get("min_gpu_total_ram_gb", 0)
+            mem_gb = detail.get("memoryInGb", 0)
+            if mem_gb * min_gpus < min_vram:
+                continue
+
+            if detail.get("maxGpuCount", 1) < min_gpus:
+                continue
+
+            offers.append(GPUOffer(
+                offer_id=gpu_id,
+                provider="runpod",
+                gpu_name=display_name,
+                num_gpus=min_gpus,
+                cost_per_hour_usd=spot_price * min_gpus,
+                reliability=None,
+                inet_up_cost_per_gb=0.0,
+                inet_down_cost_per_gb=0.0,
+                raw={
+                    **detail,
+                    "spot_price_per_gpu": spot_price,
+                    "cloud_type": cloud_type,
+                },
+            ))
+
+        offers.sort(key=lambda o: o.score)
+
+        logger.info(
+            "runpod_offers_found",
+            gpu_names=gpu_names,
+            count=len(offers),
+            top_score=round(offers[0].score, 4) if offers else None,
+        )
+        return offers
+
+    async def create_instance(
+        self,
+        offer: GPUOffer,
+        vllm_command: str,
+        hf_token: str,
+        disk_gb: int = 50,
+    ) -> ProvisionedInstance:
+        """Create a spot pod via ``podRentInterruptable`` and wait for SSH."""
+        import json as _json
+
+        cloud_type = offer.raw.get("cloud_type", "COMMUNITY")
+        spot_price = offer.raw.get("spot_price_per_gpu") or 0
+
+        env_json = _json.dumps({"HF_TOKEN": hf_token, "VLLM_CMD": vllm_command})
+
+        mutation = f"""
+        mutation {{
+          podRentInterruptable(input: {{
+            bidPerGpu: {spot_price:.4f}
+            cloudType: {cloud_type}
+            gpuCount: {offer.num_gpus}
+            gpuTypeId: "{offer.offer_id}"
+            name: "shittytoken-worker"
+            imageName: "vllm/vllm-openai:latest"
+            containerDiskInGb: {disk_gb}
+            volumeInGb: 0
+            ports: "8080/http,22/tcp"
+            startSsh: true
+            supportPublicIp: true
+            dockerArgs: "{vllm_command}"
+            env: {env_json}
+          }}) {{
+            id
+            imageName
+            machineId
+          }}
+        }}
+        """
+
+        logger.info(
+            "runpod_creating_spot_pod",
+            gpu_type=offer.offer_id,
+            gpu_count=offer.num_gpus,
+            spot_price=round(spot_price, 4),
+            cloud_type=cloud_type,
+        )
+
+        result = await self._async_graphql(mutation)
+        pod_data = result.get("podRentInterruptable", {})
+        pod_id = pod_data.get("id")
+        if not pod_id:
+            raise RuntimeError(
+                f"RunPod podRentInterruptable returned no pod ID: {result}"
+            )
+
+        logger.info("runpod_pod_created", pod_id=pod_id, offer_id=offer.offer_id)
+
+        # Poll until SSH is ready (up to 10 minutes)
+        max_attempts = 120
+        for attempt in range(max_attempts):
+            await asyncio.sleep(5)
+            info = await self.get_instance(pod_id)
+            status = info.get("desiredStatus", "")
+            runtime = info.get("runtime", {})
+            ports = runtime.get("ports", []) if runtime else []
+
+            ssh_host, ssh_port = self._extract_ssh_from_ports(ports, info)
+
+            if attempt % 6 == 5:
+                logger.info(
+                    "runpod_waiting_for_ssh",
+                    pod_id=pod_id,
+                    attempt=attempt + 1,
+                    elapsed_s=(attempt + 1) * 5,
+                    status=status,
+                    ssh_host=ssh_host or "(not ready)",
+                )
+
+            if ssh_host and status == "RUNNING":
+                # Extract HTTP port for vLLM (container port 8080)
+                http_port = self._extract_http_port(ports)
+                logger.info(
+                    "runpod_pod_ready",
+                    pod_id=pod_id,
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    http_port=http_port,
+                    wait_s=(attempt + 1) * 5,
+                )
+                return ProvisionedInstance(
+                    instance_id=pod_id,
+                    provider="runpod",
+                    gpu_model=offer.gpu_name,
+                    ssh_host=ssh_host,
+                    ssh_port=ssh_port,
+                    http_port=http_port,
+                    status="running",
+                )
+
+        raise TimeoutError(
+            f"RunPod pod {pod_id} did not become SSH-ready within 600 s"
+        )
+
+    async def destroy_instance(self, instance_id: str) -> None:
+        """Terminate a pod permanently."""
+        await asyncio.to_thread(self._runpod.terminate_pod, instance_id)
+        logger.info("runpod_pod_destroyed", pod_id=instance_id)
+
+    async def get_instance(self, instance_id: str) -> dict:
+        """Get pod details. Returns empty dict on failure."""
+        try:
+            result = await asyncio.to_thread(self._runpod.get_pod, instance_id)
+            if isinstance(result, dict):
+                return result
+        except Exception as exc:
+            logger.warning("runpod_get_pod_failed", pod_id=instance_id, error=str(exc))
+        return {}
+
+    # -- Helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _extract_spot_price(detail: dict, cloud_type: str) -> float | None:
+        """Extract the spot price from a GPU detail dict."""
+        if cloud_type == "SECURE":
+            return detail.get("secureSpotPrice")
+        if cloud_type == "COMMUNITY":
+            return detail.get("communitySpotPrice")
+        # ALL — prefer community, fall back to secure
+        return detail.get("communitySpotPrice") or detail.get("secureSpotPrice")
+
+    @staticmethod
+    def _extract_ssh_from_ports(
+        ports: list[dict],
+        pod_info: dict,
+    ) -> tuple[str | None, int]:
+        """Parse SSH host/port from RunPod pod runtime ports or pod-level fields.
+
+        RunPod exposes ports in ``runtime.ports`` as a list of dicts:
+        ``{"privatePort": 22, "publicPort": 12345, "ip": "x.x.x.x", ...}``
+
+        Falls back to pod-level ``machine.podHostId`` if ports list is empty.
+        """
+        for port_entry in ports:
+            if port_entry.get("privatePort") == 22:
+                ip = port_entry.get("ip")
+                public_port = port_entry.get("publicPort", 22)
+                if ip:
+                    return ip, int(public_port)
+
+        # Fallback: some pod responses have these at top level
+        ssh_host = pod_info.get("machine", {}).get("podHostId") if isinstance(pod_info.get("machine"), dict) else None
+        return ssh_host, 22
+
+    @staticmethod
+    def _extract_http_port(ports: list[dict]) -> int | None:
+        """Extract the public port mapped to container port 8080 (vLLM)."""
+        for port_entry in ports:
+            if port_entry.get("privatePort") == 8080:
+                return int(port_entry.get("publicPort", 8080))
+        return None
+
+    @staticmethod
+    def is_spot_eviction(pod_info: dict) -> bool:
+        """Return True if the pod status indicates a spot eviction.
+
+        A spot eviction is detected when the pod is EXITED but was
+        interruptable — distinguishing it from a manual stop.
+        """
+        status = pod_info.get("desiredStatus", "")
+        pod_type = pod_info.get("podType", "")
+        return status == "EXITED" and pod_type == "INTERRUPTABLE"
+
+
+# ---------------------------------------------------------------------------
+# Provider factory
+# ---------------------------------------------------------------------------
+
+
+def get_provider(
+    provider_name: str,
+    vastai_api_key: str = "",
+    runpod_api_key: str = "",
+    session: aiohttp.ClientSession | None = None,
+) -> GPUProvider:
+    """Instantiate a provider by name.
+
+    Args:
+        provider_name: One of ``"vastai"``, ``"runpod"``.
+        vastai_api_key: API key for Vast.ai.
+        runpod_api_key: API key for RunPod.
+        session: Optional shared aiohttp session.
+
+    Raises:
+        ValueError: If the provider name is unknown or the API key is missing.
+    """
+    if provider_name == "vastai":
+        if not vastai_api_key:
+            raise ValueError("vastai_api_key is required for the vastai provider")
+        return VastAIProvider(api_key=vastai_api_key, session=session)
+    if provider_name == "runpod":
+        if not runpod_api_key:
+            raise ValueError("runpod_api_key is required for the runpod provider")
+        return RunPodProvider(api_key=runpod_api_key, session=session)
+    raise ValueError(f"Unknown provider: {provider_name!r} (expected 'vastai' or 'runpod')")
 
 
 # ---------------------------------------------------------------------------

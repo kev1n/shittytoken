@@ -51,6 +51,7 @@ class InstanceRecord:
     gpu_model: str
     ssh_host: str = ""
     ssh_port: int = 22
+    http_port: int | None = None  # public port mapped to container 8080
     worker_url: str = ""
     state: InstanceState = InstanceState.PROVISIONING
     config_id: str = ""    # KG Configuration.config_id

@@ -19,6 +19,9 @@ gpus:
     - name: "RTX 4090"
       vram_gb: 24
       memory_bandwidth_gbs: 1008
+    - name: "L40S"
+      vram_gb: 48
+      memory_bandwidth_gbs: 864
     - name: "A100 SXM4 80GB"
       vram_gb: 80
       memory_bandwidth_gbs: 2000
@@ -27,24 +30,24 @@ gpus:
       memory_bandwidth_gbs: 3350
 
   # GPUs to search for when provisioning spot instances
-  preferred: ["RTX 3090", "RTX 4090"]
+  preferred: ["L40S"]
 
   # Minimum requirements for offer filtering
   min_gpu_total_ram_gb: 48
   min_inet_up_mbps: 100.0
   min_pcie_bw_gbps: 5.0
   min_reliability: 0.99
-  min_gpus: 2
+  min_gpus: 1
 
 # ── vLLM defaults ──────────────────────────────────────────────────────────
 # Initial configuration seeded into the knowledge graph per GPU.
 # The agent may propose different values via OOM recovery or LLM config proposal.
 vllm:
   defaults:
-    tensor_parallel_size: 2
-    max_model_len: 200000
+    tensor_parallel_size: 1
+    max_model_len: 131072
     gpu_memory_utilization: 0.90
-    quantization: "awq"
+    quantization: null  # let vLLM auto-detect from model config
     kv_cache_dtype: "auto"
     max_num_seqs: 64
     enable_prefix_caching: true
@@ -58,8 +61,6 @@ gateway:
     port: 8001
     metrics_port: 29000
     policy: "cache_aware"
-    engine_stats_interval: 10
-    config_path: "/tmp/shittytoken-router-config.json"
     health_check_timeout_sec: 30.0
 
   nginx:
@@ -69,13 +70,19 @@ gateway:
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 orchestrator:
+  provider: runpod  # vastai | runpod
   min_workers: 1
   scale_up_waiting_threshold: 10
   scale_down_idle_seconds: 300
   scale_down_cache_max: 0.50
   metrics_poll_interval_s: 10
   health_check_interval_s: 30
-  startup_monitor_timeout_s: 600
+  startup_monitor_timeout_s: 1200
+
+  # RunPod-specific settings (spot only)
+  runpod:
+    cloud_type: SECURE  # COMMUNITY | SECURE | ALL
+    spot_poll_interval_sec: 10
 
 # ── SSH ─────────────────────────────────────────────────────────────────────
 ssh:
@@ -95,7 +102,14 @@ benchmark:
   # Shape
   metrics_scrape_interval_sec: 2.0
   warm_up_requests_per_prefix: 7
-  concurrency_levels: [1, 2, 4, 8, 16, 32, 64]
+  concurrency_levels: [1, 4, 8, 16]
+
+  # Long-context agent flow (phase 4)
+  long_context:
+    enabled: true
+    context_steps_tokens: [8192, 16384, 32768, 65536, 131072]
+    output_tokens_per_step: 512
+    request_timeout_sec: 300.0  # long-context needs more time
 
   # Timeouts
   request_timeout_sec: 120.0
