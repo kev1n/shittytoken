@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — ShittyToken{% endblock %}
+
+{% block content %}
+<h1 style="color: var(--text-bright); font-size: 1.75rem; margin-bottom: 1.5rem;">Dashboard</h1>
+
+<!-- Balance widget -->
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem;">
+    <div class="card">
+        <div class="text-dim" style="font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px;">Balance</div>
+        <div style="font-size: 2.5rem; font-weight: 800; color: var(--accent); margin-top: 0.25rem;">
+            ${{ "%.2f"|format(balance_dollars) }}
+        </div>
+        <a href="/billing" class="btn btn-outline btn-sm mt-2">Add Credits</a>
+    </div>
+    <div class="card">
+        <div class="text-dim" style="font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px;">API Keys</div>
+        <div style="font-size: 2.5rem; font-weight: 800; color: var(--text-bright); margin-top: 0.25rem;">
+            {{ api_keys|selectattr("is_active")|list|length }}
+        </div>
+        <div class="text-dim" style="font-size: 0.85rem;">active keys</div>
+    </div>
+</div>
+
+<!-- New API key display -->
+{% if new_api_key %}
+<div class="card" style="border-color: var(--accent);">
+    <h3 style="color: var(--accent); margin-bottom: 0.5rem;">New API Key Created</h3>
+    <p class="text-dim mb-2" style="font-size: 0.85rem;">
+        Copy this key now. You will not be able to see it again.
+    </p>
+    <div class="key-display">
+        <code id="new-key">{{ new_api_key }}</code>
+        <button class="copy-btn" onclick="copyKey()">Copy</button>
+    </div>
+</div>
+{% endif %}
+
+<!-- API Base URL -->
+<div class="card">
+    <h3 style="color: var(--text-bright); margin-bottom: 0.75rem;">API Endpoint</h3>
+    <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 1rem;">
+        <code class="mono" style="color: var(--accent); font-size: 0.85rem;">{{ gateway_base_url }}/v1/chat/completions</code>
+    </div>
+    <details style="margin-top: 0.5rem;">
+        <summary style="cursor: pointer; color: var(--text-dim); font-size: 0.85rem;">Show curl example</summary>
+        <pre style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin-top: 0.5rem; overflow-x: auto; font-size: 0.8rem; line-height: 1.5;"><code class="mono" style="color: var(--text);">curl {{ gateway_base_url }}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 256
+  }'</code></pre>
+    </details>
+</div>
+
+<!-- API Keys -->
+<div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+        <h3 style="color: var(--text-bright);">API Keys</h3>
+        <form method="post" action="/api-keys/create" style="display: flex; gap: 0.5rem; align-items: center;">
+            <input type="text" name="name" placeholder="Key name (optional)" style="
+                background: var(--bg);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                color: var(--text);
+                padding: 0.35rem 0.75rem;
+                font-size: 0.85rem;
+                width: 180px;
+            ">
+            <button type="submit" class="btn btn-primary btn-sm">Generate Key</button>
+        </form>
+    </div>
+
+    {% if api_keys %}
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Key Hash (prefix)</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for key in api_keys %}
+            <tr>
+                <td>{{ key.name or "Unnamed" }}</td>
+                <td class="mono" style="font-size: 0.8rem; color: var(--text-dim);">{{ key.key_hash[:16] }}...</td>
+                <td>
+                    {% if key.is_active %}
+                        <span class="badge badge-active">Active</span>
+                    {% else %}
+                        <span class="badge badge-revoked">Revoked</span>
+                    {% endif %}
+                </td>
+                <td class="text-dim" style="font-size: 0.85rem;">
+                    {{ key.created_at.strftime('%b %d, %Y') if key.created_at else 'N/A' }}
+                </td>
+                <td>
+                    {% if key.is_active %}
+                    <form method="post" action="/api-keys/{{ key.key_hash }}/revoke" style="display:inline;">
+                        <button type="submit" class="btn btn-danger btn-sm"
+                            onclick="return confirm('Revoke this API key? This cannot be undone.')">
+                            Revoke
+                        </button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="text-dim text-center" style="padding: 2rem 0;">
+        No API keys yet. Generate one to get started.
+    </p>
+    {% endif %}
+</div>
+
+<!-- Recent Usage -->
+<div class="card">
+    <h3 style="color: var(--text-bright); margin-bottom: 1rem;">Recent Usage</h3>
+    {% if recent_usage %}
+    <table>
+        <thead>
+            <tr>
+                <th>Model</th>
+                <th>Tokens</th>
+                <th>Cost</th>
+                <th>Time</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for u in recent_usage %}
+            <tr>
+                <td class="mono" style="font-size: 0.8rem;">{{ u.model.split('/')[-1][:30] }}</td>
+                <td>
+                    <span class="text-dim" style="font-size: 0.8rem;">{{ u.prompt_tokens }} + {{ u.completion_tokens }}</span>
+                    = {{ u.total_tokens }}
+                </td>
+                <td style="color: var(--accent);">${{ "%.4f"|format(u.cost_cents / 100) }}</td>
+                <td class="text-dim" style="font-size: 0.85rem;">
+                    {{ u.created_at.strftime('%b %d %H:%M') if u.created_at else 'N/A' }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="text-dim text-center" style="padding: 2rem 0;">
+        No usage yet. Make your first API request to see stats here.
+    </p>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function copyKey() {
+    const keyEl = document.getElementById('new-key');
+    if (!keyEl) return;
+    navigator.clipboard.writeText(keyEl.textContent.trim()).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+    });
+}
+</script>
+{% endblock %}

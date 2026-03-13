@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}ShittyToken — Cheap AI Inference. No BS.{% endblock %}
+
+{% block content %}
+<div style="text-align:center; padding: 4rem 0 3rem;">
+    <h1 style="font-size: 3.5rem; font-weight: 900; color: var(--text-bright); line-height: 1.1; margin-bottom: 1rem;">
+        GPU go <span style="color: var(--accent);">brrr</span>
+    </h1>
+    <p style="font-size: 1.25rem; color: var(--text-dim); max-width: 500px; margin: 0 auto 2rem;">
+        Cheap AI inference. No BS. No subscriptions.<br>
+        Just pay for what you use.
+    </p>
+    {% if not user_id %}
+    <a href="/signup" class="btn btn-primary" style="font-size: 1.1rem; padding: 0.75rem 2rem;">
+        Get Started
+    </a>
+    <span style="color: var(--text-dim); margin: 0 0.5rem;">or</span>
+    <a href="/login" class="btn btn-outline" style="font-size: 1.1rem; padding: 0.75rem 2rem;">
+        Log In
+    </a>
+    {% else %}
+    <a href="/dashboard" class="btn btn-primary" style="font-size: 1.1rem; padding: 0.75rem 2rem;">
+        Go to Dashboard
+    </a>
+    {% endif %}
+</div>
+
+<!-- How it works -->
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; margin-bottom: 3rem;">
+    <div class="card" style="text-align: center;">
+        <div style="font-size: 2rem; margin-bottom: 0.5rem;">1</div>
+        <h3 style="color: var(--accent); margin-bottom: 0.5rem;">Sign Up</h3>
+        <p class="text-dim">Create an account in 10 seconds. No credit card required to start.</p>
+    </div>
+    <div class="card" style="text-align: center;">
+        <div style="font-size: 2rem; margin-bottom: 0.5rem;">2</div>
+        <h3 style="color: var(--accent); margin-bottom: 0.5rem;">Add Credits</h3>
+        <p class="text-dim">Top up your balance. Starting at $5. Pay only for what you use.</p>
+    </div>
+    <div class="card" style="text-align: center;">
+        <div style="font-size: 2rem; margin-bottom: 0.5rem;">3</div>
+        <h3 style="color: var(--accent); margin-bottom: 0.5rem;">Make Requests</h3>
+        <p class="text-dim">OpenAI-compatible API. Drop in your key and go. It just works.</p>
+    </div>
+</div>
+
+<!-- Features -->
+<div class="card" style="margin-bottom: 1.5rem;">
+    <h2 style="color: var(--text-bright); margin-bottom: 1rem;">Why ShittyToken?</h2>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+        <div>
+            <h4 style="color: var(--accent); margin-bottom: 0.25rem;">OpenAI-Compatible</h4>
+            <p class="text-dim" style="font-size: 0.9rem;">Drop-in replacement for /v1/chat/completions. Use any OpenAI SDK.</p>
+        </div>
+        <div>
+            <h4 style="color: var(--accent); margin-bottom: 0.25rem;">Pay-As-You-Go</h4>
+            <p class="text-dim" style="font-size: 0.9rem;">No monthly fees. No commitments. Credits never expire.</p>
+        </div>
+        <div>
+            <h4 style="color: var(--accent); margin-bottom: 0.25rem;">Cheap AF</h4>
+            <p class="text-dim" style="font-size: 0.9rem;">Spot GPU instances + smart routing = prices that don't suck.</p>
+        </div>
+        <div>
+            <h4 style="color: var(--accent); margin-bottom: 0.25rem;">Fast</h4>
+            <p class="text-dim" style="font-size: 0.9rem;">Multi-GPU inference with prefix caching. Low latency, high throughput.</p>
+        </div>
+    </div>
+</div>
+
+<!-- Pricing -->
+<div class="card">
+    <h2 style="color: var(--text-bright); margin-bottom: 0.5rem;">Pricing</h2>
+    <p class="text-dim mb-2">Simple. Transparent. No gotchas.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Model</th>
+                <th>Price per 1M tokens</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td class="mono" style="font-size: 0.85rem;">Qwen3.5-35B-A3B (AWQ)</td>
+                <td style="color: var(--accent); font-weight: 600;">$1.00</td>
+                <td class="text-dim" style="font-size: 0.85rem;">35B params, 3B active (MoE)</td>
+            </tr>
+        </tbody>
+    </table>
+    <p class="text-dim mt-2" style="font-size: 0.85rem;">
+        Prices may vary. We run on spot GPUs so costs stay low. You benefit.
+    </p>
+</div>
+
+<!-- Code example -->
+<div class="card" style="margin-top: 1.5rem;">
+    <h3 style="color: var(--text-bright); margin-bottom: 0.75rem;">Quick Start</h3>
+    <pre style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.8rem; line-height: 1.5;"><code class="mono" style="color: var(--text);">curl http://localhost:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-st-YOUR_API_KEY" \
+  -d '{
+    "model": "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 256
+  }'</code></pre>
+</div>
+{% endblock %}

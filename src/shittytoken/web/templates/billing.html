@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}Billing — ShittyToken{% endblock %}
+
+{% block content %}
+<h1 style="color: var(--text-bright); font-size: 1.75rem; margin-bottom: 1.5rem;">Billing</h1>
+
+<!-- Balance -->
+<div class="card">
+    <div class="text-dim" style="font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.25rem;">Current Balance</div>
+    <div style="font-size: 3rem; font-weight: 800; color: var(--accent);">
+        ${{ "%.2f"|format(balance_dollars) }}
+    </div>
+    <div class="text-dim" style="font-size: 0.85rem;">{{ balance_cents }} cents across {{ credit_blocks|length }} active credit block{{ 's' if credit_blocks|length != 1 else '' }}</div>
+</div>
+
+<!-- Top Up -->
+<div class="card">
+    <h3 style="color: var(--text-bright); margin-bottom: 1rem;">Add Credits</h3>
+    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem;">
+        {% for amount in [5, 10, 25, 50] %}
+        <form method="post" action="/billing/topup">
+            <input type="hidden" name="amount" value="{{ amount }}">
+            <button type="submit" class="btn btn-outline" style="width: 100%; padding: 1rem; font-size: 1.1rem; font-weight: 700;">
+                ${{ amount }}
+            </button>
+        </form>
+        {% endfor %}
+    </div>
+    <p class="text-dim mt-2" style="font-size: 0.8rem;">
+        Payments via Stripe. Credits never expire. No recurring charges.
+    </p>
+</div>
+
+<!-- Credit Blocks -->
+<div class="card">
+    <h3 style="color: var(--text-bright); margin-bottom: 1rem;">Active Credit Blocks</h3>
+    {% if credit_blocks %}
+    <table>
+        <thead>
+            <tr>
+                <th>Source</th>
+                <th>Original</th>
+                <th>Remaining</th>
+                <th>Purchased</th>
+                <th>Expires</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for block in credit_blocks %}
+            <tr>
+                <td>
+                    <span class="badge badge-active">{{ block.source }}</span>
+                </td>
+                <td>${{ "%.2f"|format(block.original_cents / 100) }}</td>
+                <td style="color: var(--accent); font-weight: 600;">${{ "%.2f"|format(block.remaining_cents / 100) }}</td>
+                <td class="text-dim" style="font-size: 0.85rem;">
+                    {{ block.purchased_at.strftime('%b %d, %Y') if block.purchased_at else 'N/A' }}
+                </td>
+                <td class="text-dim" style="font-size: 0.85rem;">
+                    {{ block.expires_at.strftime('%b %d, %Y') if block.expires_at else 'Never' }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="text-dim text-center" style="padding: 2rem 0;">
+        No active credit blocks. Add some credits to get started.
+    </p>
+    {% endif %}
+</div>
+
+<!-- Ledger -->
+<div class="card">
+    <h3 style="color: var(--text-bright); margin-bottom: 1rem;">Transaction History</h3>
+    {% if ledger_events %}
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Amount</th>
+                <th>Date</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for event in ledger_events %}
+            <tr>
+                <td>
+                    {% if event.event_type == 'credit_purchase' %}
+                        <span style="color: var(--accent);">Credit Purchase</span>
+                    {% elif event.event_type == 'usage_deduction' %}
+                        <span style="color: var(--text-dim);">Usage</span>
+                    {% elif event.event_type == 'expiration' %}
+                        <span style="color: var(--warning);">Expired</span>
+                    {% elif event.event_type == 'refund' %}
+                        <span style="color: var(--info);">Refund</span>
+                    {% else %}
+                        <span>{{ event.event_type }}</span>
+                    {% endif %}
+                </td>
+                <td style="font-weight: 600; color: {{ 'var(--accent)' if event.amount_cents > 0 else 'var(--text-dim)' }};">
+                    {% if event.amount_cents > 0 %}+{% endif %}${{ "%.4f"|format(event.amount_cents / 100) }}
+                </td>
+                <td class="text-dim" style="font-size: 0.85rem;">
+                    {{ event.created_at.strftime('%b %d, %Y %H:%M') if event.created_at else 'N/A' }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="text-dim text-center" style="padding: 2rem 0;">
+        No transactions yet.
+    </p>
+    {% endif %}
+</div>
+{% endblock %}

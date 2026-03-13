@@ -110,6 +110,10 @@ class Settings(BaseSettings):
 
     # Stripe (billing)
     stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+
+    # Web session
+    web_session_secret: str = "change-me-in-production"
 
     # SSH
     ssh_private_key_path: str = "~/.ssh/id_ed25519"

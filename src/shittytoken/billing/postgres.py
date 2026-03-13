@@ -23,9 +23,13 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email TEXT NOT NULL UNIQUE,
+    password_hash TEXT,
     stripe_customer_id TEXT UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Migration: add password_hash to existing tables
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
 CREATE TABLE IF NOT EXISTS api_keys (
     key_hash TEXT PRIMARY KEY,
@@ -175,6 +179,28 @@ class BillingPostgres:
         )
         return _user_from_row(row) if row else None
 
+    async def create_user_with_password(
+        self, email: str, password_hash: str
+    ) -> User:
+        row = await self._pool.fetchrow(
+            "INSERT INTO users (email, password_hash) "
+            "VALUES ($1, $2) RETURNING *",
+            email,
+            password_hash,
+        )
+        return _user_from_row(row)
+
+    async def get_user_by_email_with_password(
+        self, email: str
+    ) -> tuple[User, str | None] | None:
+        """Returns (User, password_hash) or None if user not found."""
+        row = await self._pool.fetchrow(
+            "SELECT * FROM users WHERE email = $1", email
+        )
+        if row is None:
+            return None
+        return _user_from_row(row), row.get("password_hash")
+
     # ── API key ops ───────────────────────────────────────────────────
 
     async def create_api_key(
@@ -195,6 +221,13 @@ class BillingPostgres:
             key_hash,
         )
         return _api_key_from_row(row) if row else None
+
+    async def list_api_keys_for_user(self, user_id: str) -> list[ApiKey]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC",
+            uuid.UUID(user_id),
+        )
+        return [_api_key_from_row(r) for r in rows]
 
     async def deactivate_api_key(self, key_hash: str) -> None:
         await self._pool.execute(
@@ -379,6 +412,17 @@ class BillingPostgres:
             event.cost_cents,
             event.latency_ms,
             event.request_id,
+        )
+
+    async def get_recent_usage(
+        self, user_id: str, limit: int = 50
+    ) -> list[asyncpg.Record]:
+        """Return recent usage events as raw records."""
+        return await self._pool.fetch(
+            "SELECT * FROM usage_events "
+            "WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+            uuid.UUID(user_id),
+            limit,
         )
 
     async def batch_record_usage(self, events: list[UsageEvent]) -> None:

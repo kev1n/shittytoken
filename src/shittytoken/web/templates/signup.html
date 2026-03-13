@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Sign Up — ShittyToken{% endblock %}
+
+{% block content %}
+<div style="max-width: 400px; margin: 3rem auto;">
+    <h1 style="color: var(--text-bright); font-size: 1.75rem; margin-bottom: 0.5rem;">Create Account</h1>
+    <p class="text-dim mb-3">Get your API key in under a minute.</p>
+
+    <form method="post" action="/signup">
+        <div class="form-group">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" required autocomplete="email" placeholder="you@example.com">
+        </div>
+        <div class="form-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required minlength="8" placeholder="At least 8 characters">
+        </div>
+        <div class="form-group">
+            <label for="password_confirm">Confirm Password</label>
+            <input type="password" id="password_confirm" name="password_confirm" required minlength="8" placeholder="Same password again">
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: 0.5rem;">
+            Create Account
+        </button>
+    </form>
+
+    <p class="text-dim text-center mt-3" style="font-size: 0.9rem;">
+        Already have an account? <a href="/login">Log in</a>
+    </p>
+</div>
+{% endblock %}
