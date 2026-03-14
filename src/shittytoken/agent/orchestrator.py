@@ -75,6 +75,7 @@ class Orchestrator:
         self._cost_tracker = CostTracker()
 
         self._provision_lock = asyncio.Lock()
+        self._provision_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
         self._session: Optional[aiohttp.ClientSession] = None
         self._provider: Optional[GPUProvider] = None
@@ -83,6 +84,7 @@ class Orchestrator:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._spot_monitor_task: Optional[asyncio.Task] = None
         self._provision_cooldown_until: float = 0.0
+        self._scale_events: dict[str, int] = {"scale_up": 0, "scale_down": 0}
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -176,7 +178,7 @@ class Orchestrator:
                 logger.info("provision_cooldown", remaining_s=remaining)
             elif not provisioning:
                 logger.info("min_workers_provision", min_workers=min_workers)
-                asyncio.create_task(self._guarded_provision())
+                self._provision_task = asyncio.create_task(self._guarded_provision())
             await self._sweep_stuck_instances()
             self._cost_tracker.maybe_log_summary()
             return
@@ -227,14 +229,17 @@ class Orchestrator:
                     waiting=metrics.total_requests_waiting,
                     threshold=_orch["scale_up_waiting_threshold"],
                 )
-                asyncio.create_task(self._guarded_provision())
+                self._scale_events["scale_up"] += 1
+                self._provision_task = asyncio.create_task(self._guarded_provision())
 
         # Scale down (never below min_workers)
         elif len(serving_urls) > min_workers:
             await self._maybe_scale_down(metrics)
 
         await self._sweep_stuck_instances()
+        await self._maybe_evict_volumes()
         self._cost_tracker.maybe_log_summary()
+        await self._push_metrics_to_gateway()
 
     # ------------------------------------------------------------------
     # Provisioning
@@ -295,14 +300,41 @@ class Orchestrator:
             await self._state_store.delete(instance_id)
 
     async def _recover_instances(self) -> None:
-        """Reload instance records from Redis and recover or clean up each one."""
+        """Reload instance records from Redis, scan provider for orphans, recover or clean up."""
         records = await self._state_store.load_all()
+        provider = self._get_provider()
+        known_ids = {r.instance_id for r in records}
+
+        # Scan provider API for ALL running instances — catch orphans not in Redis
+        try:
+            all_provider_instances = await provider.list_all_instances()
+        except Exception as exc:
+            logger.warning("recovery_provider_scan_failed", error=str(exc))
+            all_provider_instances = []
+
+        orphan_ids = {
+            str(inst.get("id"))
+            for inst in all_provider_instances
+            if str(inst.get("id")) not in known_ids
+        }
+        if orphan_ids:
+            logger.warning(
+                "recovery_orphans_found",
+                count=len(orphan_ids),
+                instance_ids=list(orphan_ids),
+            )
+            for orphan_id in orphan_ids:
+                try:
+                    await provider.destroy_instance(orphan_id)
+                    logger.info("recovery_orphan_destroyed", instance_id=orphan_id)
+                except Exception as exc:
+                    logger.warning("recovery_orphan_destroy_failed", instance_id=orphan_id, error=str(exc))
+
         if not records:
             logger.info("recovery_no_instances")
             return
 
         logger.info("recovery_starting", count=len(records))
-        provider = self._get_provider()
 
         # Verify all instances concurrently
         poll_results = await asyncio.gather(
@@ -373,6 +405,32 @@ class Orchestrator:
             await self._state_store.delete(record.instance_id)
 
     # ------------------------------------------------------------------
+    # Metrics push
+    # ------------------------------------------------------------------
+
+    async def _push_metrics_to_gateway(self) -> None:
+        """Push orchestrator state to the gateway's /admin/metrics endpoint."""
+        counts: dict[str, int] = {}
+        for sm in self._instances.values():
+            s = sm.state.value
+            counts[s] = counts.get(s, 0) + 1
+        payload = {
+            "instances": counts,
+            "scale_events": dict(self._scale_events),
+            "cost": {
+                "hourly_burn_usd": self._cost_tracker.hourly_burn_usd,
+                "cumulative_cost_usd": self._cost_tracker.cumulative_cost_usd,
+            },
+        }
+        try:
+            from ..gateway.router_manager import ROUTER_PORT
+            url = f"http://localhost:{ROUTER_PORT}/admin/metrics"
+            async with self._session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                if resp.status != 200:
+                    logger.debug("push_metrics_failed", status=resp.status)
+        except Exception:
+            pass  # Non-critical — don't spam logs
+
     # Stuck instance sweep
     # ------------------------------------------------------------------
 
@@ -395,6 +453,25 @@ class Orchestrator:
                 )
                 sm.transition(InstanceState.FAILED, reason="stuck_timeout")
                 await self._destroy_instance(sm.record, sm)
+
+    # Volume eviction
+    # ------------------------------------------------------------------
+
+    async def _maybe_evict_volumes(self) -> None:
+        """Periodically evict stale volumes (once per hour)."""
+        vol_cfg = cfg.get("orchestrator", {}).get("volume_cache", {})
+        if not vol_cfg.get("enabled", False):
+            return
+
+        now = time.monotonic()
+        if now - getattr(self, "_last_volume_eviction", 0) < 3600:
+            return
+        self._last_volume_eviction = now
+
+        eviction_days = vol_cfg.get("eviction_days", 3)
+        provider = self._get_provider()
+        if hasattr(provider, "evict_stale_volumes"):
+            await provider.evict_stale_volumes(eviction_days)
 
     # ------------------------------------------------------------------
     # Scale down
@@ -423,6 +500,7 @@ class Orchestrator:
                     idle_secs=round(idle_secs, 1),
                     avg_kv_cache=round(metrics.avg_kv_cache_usage, 3),
                 )
+                self._scale_events["scale_down"] += 1
                 await self._scale_down_one()
                 return
 
@@ -474,6 +552,15 @@ class Orchestrator:
         """Drain all SERVING workers, terminate all instances, close KG."""
         logger.info("orchestrator_shutdown_initiated")
         self._shutdown_event.set()
+
+        # Cancel any in-flight provision to prevent orphaned instances
+        if self._provision_task and not self._provision_task.done():
+            self._provision_task.cancel()
+            try:
+                await self._provision_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            logger.info("orchestrator_provision_cancelled")
 
         for sm in list(self._instances.values()):
             if sm.state == InstanceState.SERVING:

@@ -43,6 +43,10 @@ def configure_logging(log_dir: str | Path | None = None) -> None:
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
+    # Silence noisy third-party loggers
+    for noisy in ("neo4j", "vastai", "urllib3", "asyncio", "aiohttp"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     # Shared pre-processing chain
     shared_processors = [
         structlog.stdlib.add_log_level,

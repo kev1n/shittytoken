@@ -178,7 +178,7 @@ async def dashboard(request: web.Request) -> dict:
             "prompt_tokens": row["prompt_tokens"],
             "completion_tokens": row["completion_tokens"],
             "total_tokens": row["total_tokens"],
-            "cost_cents": row["cost_cents"],
+            "cost_cents": float(row["cost_cents"]),
             "created_at": row["created_at"],
         })
 

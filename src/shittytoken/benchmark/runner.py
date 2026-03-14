@@ -15,8 +15,37 @@ from .phases import (
 from .request_generator import VirtualUserPool
 from .results_analyzer import evaluate_benchmark
 from .schema import BenchmarkResult, BenchmarkVerdict, FailReason
+from .sse_client import send_chat_completion
 
 logger = structlog.get_logger()
+
+
+async def _warmup_gpu(session: aiohttp.ClientSession, base_url: str, num_requests: int = 3) -> None:
+    """Send a few throwaway requests to warm up CUDA kernels and torch.compile caches.
+
+    The first request to a fresh vLLM instance triggers JIT compilation of
+    CUDA kernels for the actual batch size, which can add 10-50s of latency.
+    Running these before the benchmark avoids penalizing Phase 1 measurements.
+    """
+    logger.info("warmup_start", num_requests=num_requests)
+    for i in range(num_requests):
+        result = await send_chat_completion(
+            session=session,
+            base_url=base_url,
+            messages=[{"role": "user", "content": f"Say hello {i}"}],
+            max_tokens=50,
+            session_id=f"warmup-{i}",
+            request_timeout=120.0,
+            first_token_timeout=120.0,
+        )
+        logger.info(
+            "warmup_request",
+            index=i,
+            success=result.success,
+            duration_sec=round(result.total_duration_sec, 2),
+            tokens=result.tokens_generated,
+        )
+    logger.info("warmup_complete")
 
 
 async def run_benchmark(
@@ -60,6 +89,9 @@ async def run_benchmark(
 
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
+            # Warm up CUDA kernels before starting measured phases
+            await _warmup_gpu(session, worker_url)
+
             pool = VirtualUserPool()
             collector = MetricsCollector(metrics_url, session)
             collector_task = asyncio.create_task(collector.run())

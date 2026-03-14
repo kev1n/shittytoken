@@ -121,3 +121,42 @@ async def list_workers(request: web.Request) -> web.Response:
     ]
 
     return web.json_response(result, status=200)
+
+
+async def update_orchestrator_metrics(request: web.Request) -> web.Response:
+    """POST /admin/metrics {"instances": {"serving": 1}, "scale_events": {"scale_up": 2}}
+
+    Called by the orchestrator to push its state into the gateway's metrics.
+    """
+    denied = _check_admin_token(request)
+    if denied is not None:
+        return denied
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"error": {"message": "Request body must be valid JSON"}},
+            status=400,
+        )
+
+    from shittytoken.gateway import prom_metrics
+
+    instances = body.get("instances")
+    if instances and isinstance(instances, dict):
+        prom_metrics.set_instance_counts(instances)
+
+    scale_events = body.get("scale_events")
+    if scale_events and isinstance(scale_events, dict):
+        for event_type, count in scale_events.items():
+            prom_metrics._scale_events[event_type] = count
+
+    # Cost metrics pushed from orchestrator's CostTracker
+    cost = body.get("cost")
+    if cost and isinstance(cost, dict):
+        prom_metrics.set_cost_metrics(
+            hourly_burn_usd=cost.get("hourly_burn_usd", 0.0),
+            cumulative_cost_usd=cost.get("cumulative_cost_usd", 0.0),
+        )
+
+    return web.json_response({"status": "ok"}, status=200)

@@ -120,7 +120,9 @@ async def send_chat_completion(
                     continue
 
                 try:
-                    content = chunk["choices"][0]["delta"].get("content", "")
+                    delta = chunk["choices"][0]["delta"]
+                    content = delta.get("content", "")
+                    reasoning = delta.get("reasoning_content", "")
                 except (KeyError, IndexError, TypeError) as exc:
                     logger.warning(
                         "sse_client.chunk_structure_error",
@@ -129,11 +131,15 @@ async def send_chat_completion(
                     )
                     continue
 
-                if content:
+                # Record TTFT on first non-empty token from either
+                # content or reasoning_content (Qwen3.5 reasoning mode
+                # sends thinking tokens in reasoning_content first).
+                if content or reasoning:
                     if ttft_sec is None:
                         ttft_sec = time.monotonic() - send_time
-                    output_parts.append(content)
                     tokens_generated += 1
+                if content:
+                    output_parts.append(content)
 
             total_duration_sec = time.monotonic() - send_time
             return RequestResult(

@@ -186,12 +186,31 @@ class BillingPipeline:
         model: str,
         prompt_tokens: int,
         completion_tokens: int,
-        pricing: dict[str, float] | None = None,
-    ) -> int:
-        """Compute cost in cents. Default $1/1M tokens. Minimum 1 cent."""
-        total = prompt_tokens + completion_tokens
-        price_per_1m = (pricing or {}).get(model, 100.0)
-        return max(math.ceil(total * price_per_1m / 1_000_000), 1)
+        pricing: dict | None = None,
+    ) -> float:
+        """Compute cost in cents using split input/output rates.
+
+        Pricing dict format:
+            {"default": {"input_per_1m": 2.5, "output_per_1m": 15.0},
+             "model/name": {"input_per_1m": X, "output_per_1m": Y}}
+
+        Falls back to $0.025/1M input, $0.15/1M output if not configured.
+        Returns fractional cents (no minimum floor).
+        """
+        pricing = pricing or {}
+        model_pricing = pricing.get(model, pricing.get("default", {}))
+
+        # Support legacy flat-rate format: {"model": 50} (cents per 1M total)
+        if isinstance(model_pricing, (int, float)):
+            total = prompt_tokens + completion_tokens
+            return total * model_pricing / 1_000_000
+
+        input_rate = model_pricing.get("input_per_1m", 2.5)   # cents per 1M
+        output_rate = model_pricing.get("output_per_1m", 15.0)  # cents per 1M
+
+        input_cost = prompt_tokens * input_rate / 1_000_000
+        output_cost = completion_tokens * output_rate / 1_000_000
+        return input_cost + output_cost
 
     async def publish_usage(
         self,
@@ -239,13 +258,33 @@ class BillingPipeline:
         # 1. Record event
         await self._postgres.record_usage_event(event)
 
-        # 2. Deduct credits FIFO
+        # 2. Accumulate fractional cents and deduct whole cents when threshold met.
+        #    Redis key "accum:{user_id}" holds the fractional remainder (float string).
+        accum_key = f"accum:{event.user_id}"
+        try:
+            prev = await self._redis._redis.get(accum_key)
+            accumulated = float(prev) if prev else 0.0
+        except (TypeError, ValueError):
+            accumulated = 0.0
+
+        accumulated += event.cost_cents
+        deduct_cents = int(accumulated)  # floor — only deduct whole cents
+
+        if deduct_cents <= 0:
+            # Still sub-cent — save remainder and skip deduction
+            await self._redis._redis.set(accum_key, str(accumulated))
+            return
+
+        # Save the fractional remainder
+        remainder = accumulated - deduct_cents
+        await self._redis._redis.set(accum_key, str(remainder))
+
         deducted = await self._postgres.deduct_credits_fifo(
             user_id=event.user_id,
-            amount_cents=event.cost_cents,
+            amount_cents=deduct_cents,
             request_id=event.request_id,
         )
-        if deducted < event.cost_cents:
+        if deducted < deduct_cents:
             log.warning(
                 "usage_pipeline.insufficient_credits",
                 event_id=event.event_id,

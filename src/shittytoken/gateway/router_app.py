@@ -17,7 +17,7 @@ from ..config import cfg
 from .worker_pool import WorkerPool
 from .routing_policy import CacheAwarePolicy
 from .proxy import handle_chat_completions, handle_models
-from .admin_api import add_worker, remove_worker, list_workers
+from .admin_api import add_worker, remove_worker, list_workers, update_orchestrator_metrics
 from .prom_metrics import handle_metrics
 from .middleware import request_id_middleware
 from .auth import auth_middleware
@@ -144,5 +144,6 @@ async def create_router_app(
     app.router.add_post("/admin/workers", add_worker)
     app.router.add_delete("/admin/workers", remove_worker)
     app.router.add_get("/admin/workers", list_workers)
+    app.router.add_post("/admin/metrics", update_orchestrator_metrics)
 
     return app

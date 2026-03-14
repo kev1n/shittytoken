@@ -26,6 +26,7 @@ dependencies = [
     "aiohttp-session[redis]>=2.12",
     "bcrypt>=4.1",
     "stripe>=8.0",
+    "datasets>=4.7.0",
 ]
 
 [project.optional-dependencies]

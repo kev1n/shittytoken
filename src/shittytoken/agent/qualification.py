@@ -161,13 +161,21 @@ async def provision_and_qualify(
             await ssh_manager.close(ssh_session)
         return None, sm
 
-    # --- Step 7/7: Run benchmark ---
-    logger.info("provision_step", step="7/7", action="running_benchmark", instance_id=record.instance_id, worker_url=worker_url)
-    bench_ok = await _run_benchmark(
-        record, sm, kg, config, model_id, worker_url, ssh_manager, ssh_session
-    )
-    if not bench_ok:
-        return None, sm
+    # --- Step 7/7: Run benchmark (or skip in test_mode) ---
+    test_mode = cfg.get("benchmark", {}).get("test_mode", False)
+    if test_mode:
+        logger.info(
+            "provision_step", step="7/7", action="skipping_benchmark",
+            instance_id=record.instance_id, worker_url=worker_url,
+            reason="test_mode=true",
+        )
+    else:
+        logger.info("provision_step", step="7/7", action="running_benchmark", instance_id=record.instance_id, worker_url=worker_url)
+        bench_ok = await _run_benchmark(
+            record, sm, kg, config, model_id, worker_url, ssh_manager, ssh_session
+        )
+        if not bench_ok:
+            return None, sm
 
     # --- Register with gateway and transition to SERVING ---
     try:
@@ -447,14 +455,26 @@ async def _run_benchmark(
     )
 
     if bench_result.verdict.value != "pass":
-        logger.warning(
-            "provision_benchmark_failed",
-            instance_id=record.instance_id,
-            verdict=bench_result.verdict.value,
-        )
-        sm.transition(InstanceState.FAILED, reason="benchmark_failed")
-        if ssh_session is not None:
-            await ssh_manager.close(ssh_session)
-        return False
+        test_mode = cfg.get("benchmark", {}).get("test_mode", False)
+        if test_mode:
+            logger.warning(
+                "provision_benchmark_failed_test_mode",
+                instance_id=record.instance_id,
+                verdict=bench_result.verdict.value,
+                fail_reasons=[r.value for r in bench_result.fail_reasons],
+                action="keeping instance (test_mode=true)",
+            )
+            # In test mode, treat as pass — keep the instance running
+            return True
+        else:
+            logger.warning(
+                "provision_benchmark_failed",
+                instance_id=record.instance_id,
+                verdict=bench_result.verdict.value,
+            )
+            sm.transition(InstanceState.FAILED, reason="benchmark_failed")
+            if ssh_session is not None:
+                await ssh_manager.close(ssh_session)
+            return False
 
     return True

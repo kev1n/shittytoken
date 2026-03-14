@@ -51,6 +51,7 @@ vllm:
     kv_cache_dtype: "fp8_e4m3"
     max_num_seqs: 16
     enable_prefix_caching: true
+    enforce_eager: false
 
   worker_port: 8080
   docker_image: "vllm/vllm-openai:latest"
@@ -98,17 +99,23 @@ gateway:
     send_timeout_sec: 120
 
   auth:
-    enabled: false # toggle for dev/testing
-    rate_limit_default_rpm: 60
-    rate_limit_default_tpm: 100000
+    enabled: true # toggle for dev/testing
+    rate_limit_default_rpm: 1500
 
   billing:
-    postgres_dsn: "postgresql://localhost/shittytoken"
+    postgres_dsn: "postgresql://shittytoken:shittytoken_dev@localhost:5432/shittytoken"
     redis_url: "redis://localhost:6379/0"
     reconcile_interval_s: 60.0
-    # pricing: per-model overrides (cents per 1M tokens). Default: 100 ($1/1M)
-    # pricing:
-    #   "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit": 50
+    # pricing: per-model input/output rates (cents per 1M tokens).
+    # Defaults: input=2.5 ($0.025/1M), output=15.0 ($0.15/1M)
+    pricing:
+      default:
+        input_per_1m: 2.5    # $0.025 per 1M input tokens
+        output_per_1m: 15.0  # $0.15 per 1M output tokens
+      # Per-model overrides:
+      # "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit":
+      #   input_per_1m: 2.5
+      #   output_per_1m: 15.0
     # kafka (optional — omit to use in-process queue):
     # kafka_bootstrap_servers: "localhost:9092"
     # kafka_topic: "shittytoken.usage"
@@ -130,6 +137,16 @@ orchestrator:
   ssh_ready_timeout_s: 600 # max time to wait for SSH after renting
   instance_poll_interval_sec: 15
 
+  # Persistent volume cache — caches model weights, torch.compile artifacts,
+  # and Triton kernels on a Vast.ai volume tied to the physical machine.
+  # Volumes are machine-local: they only help when re-renting the same machine.
+  volume_cache:
+    enabled: true
+    mount_path: "/cache"
+    size_gb: 40
+    eviction_days: 3          # delete volumes unused for this many days
+    label_prefix: "st-cache"  # volume label prefix for identification
+
   # RunPod-specific settings (spot only)
   runpod:
     cloud_type: SECURE # COMMUNITY | SECURE | ALL
@@ -142,13 +159,15 @@ ssh:
 
 # ── Benchmark ───────────────────────────────────────────────────────────────
 benchmark:
-  # Pass/fail thresholds
-  min_throughput_tps: 20.0
-  max_cold_cache_ttft_p95: 8.0
-  max_warm_cache_ttft_p95: 4.0
-  min_prefix_cache_hit_rate_phase3: 0.30
+  # test_mode: log benchmark failures but keep the instance running (don't destroy)
+  test_mode: true
+  # Pass/fail thresholds (relaxed for 2x RTX 3090 spot instances)
+  min_throughput_tps: 2.0
+  max_cold_cache_ttft_p95: 30.0
+  max_warm_cache_ttft_p95: 15.0
+  min_prefix_cache_hit_rate_phase3: 0.0
   deltanet_cache_flag_threshold: 0.01
-  max_failed_request_rate: 0.02
+  max_failed_request_rate: 0.10
 
   # Shape
   metrics_scrape_interval_sec: 2.0

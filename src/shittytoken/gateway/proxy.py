@@ -9,6 +9,7 @@ buffering.  Extracts token usage from the final SSE chunk for metrics.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Callable, Awaitable, TYPE_CHECKING
 
 import aiohttp
@@ -40,11 +41,12 @@ async def _record_usage(
     prompt_tokens: int,
     completion_tokens: int,
     on_usage: UsageCallback,
+    cached_tokens: int = 0,
 ) -> None:
     """Record token metrics and invoke the billing callback (if any)."""
     if not (prompt_tokens or completion_tokens):
         return
-    prom_metrics.add_tokens(prompt_tokens, completion_tokens)
+    prom_metrics.add_tokens(prompt_tokens, completion_tokens, cached_tokens)
     if on_usage is not None:
         try:
             result = on_usage(prompt_tokens, completion_tokens)
@@ -87,13 +89,14 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         model_id = body.get("model", "unknown")
 
         async def _billing_callback(prompt_tokens: int, completion_tokens: int) -> None:
+            latency_ms = int((time.monotonic() - request_start) * 1000)
             await pipeline.publish_usage(
                 user_id=user_id,
                 key_hash=key_hash,
                 model=model_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                latency_ms=0,
+                latency_ms=latency_ms,
                 request_id=request_id,
             )
             # Record actual tokens in rate limiter
@@ -106,6 +109,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         on_usage = request.app.get("on_usage")
 
     prom_metrics.inc_active()
+    request_start = time.monotonic()
 
     # ---- routing ---------------------------------------------------------
     prefix_key = request.headers.get("X-Session-ID")
@@ -120,6 +124,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             {"error": {"message": "No healthy workers available"}},
             status=503,
         )
+    prom_metrics.inc_worker_request(worker.url)
 
     # ---- prepare upstream request ----------------------------------------
     upstream_body = dict(body)
@@ -131,6 +136,9 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     upstream_url = f"{worker.url.rstrip('/')}/v1/chat/completions"
 
     # ---- open upstream connection ----------------------------------------
+    gateway_overhead = time.monotonic() - request_start
+    prom_metrics.observe_overhead(gateway_overhead)
+
     try:
         upstream_resp = await session.post(
             upstream_url,
@@ -189,13 +197,17 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         upstream_resp.release()
         prom_metrics.dec_active()
         prom_metrics.inc_request("POST", 200)
+        prom_metrics.observe_latency(time.monotonic() - request_start)
         try:
             resp_json = json.loads(resp_body)
             usage = resp_json.get("usage", {})
+            ptd = usage.get("prompt_tokens_details") or {}
+            cached = ptd.get("cached_tokens", 0)
             await _record_usage(
                 usage.get("prompt_tokens", 0),
                 usage.get("completion_tokens", 0),
                 on_usage,
+                cached_tokens=cached,
             )
         except (json.JSONDecodeError, AttributeError):
             pass
@@ -219,6 +231,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     last_data_line: str | None = None
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens = 0
 
     try:
         async for raw_chunk in upstream_resp.content:
@@ -239,6 +252,8 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                                 usage = final_chunk.get("usage", {})
                                 prompt_tokens = usage.get("prompt_tokens", 0)
                                 completion_tokens = usage.get("completion_tokens", 0)
+                                ptd = usage.get("prompt_tokens_details") or {}
+                                cached_tokens = ptd.get("cached_tokens", 0)
                             except (json.JSONDecodeError, AttributeError):
                                 logger.warning(
                                     "proxy.usage_parse_error",
@@ -265,7 +280,8 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     # ---- metrics & billing ------------------------------------------------
     prom_metrics.dec_active()
     prom_metrics.inc_request("POST", 200)
-    await _record_usage(prompt_tokens, completion_tokens, on_usage)
+    prom_metrics.observe_latency(time.monotonic() - request_start)
+    await _record_usage(prompt_tokens, completion_tokens, on_usage, cached_tokens=cached_tokens)
 
     await response.write_eof()
     return response

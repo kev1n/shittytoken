@@ -141,7 +141,7 @@
                     <span class="text-dim" style="font-size: 0.8rem;">{{ u.prompt_tokens }} + {{ u.completion_tokens }}</span>
                     = {{ u.total_tokens }}
                 </td>
-                <td style="color: var(--accent);">${{ "%.4f"|format(u.cost_cents / 100) }}</td>
+                <td style="color: var(--accent);">${{ "%.6f"|format(u.cost_cents / 100) }}</td>
                 <td class="text-dim" style="font-size: 0.85rem;">
                     {{ u.created_at.strftime('%b %d %H:%M') if u.created_at else 'N/A' }}
                 </td>

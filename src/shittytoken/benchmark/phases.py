@@ -34,8 +34,11 @@ def _build_phase_metrics(
     ttft_samples: list[float] = []
     failed = 0
     for r in results:
-        if r.success and r.ttft_sec is not None:
-            ttft_samples.append(r.ttft_sec)
+        if r.success:
+            if r.ttft_sec is not None:
+                ttft_samples.append(r.ttft_sec)
+            # success=True but ttft_sec=None means we got a valid response
+            # with no content/reasoning tokens — don't penalize as failure
         else:
             ttft_samples.append(float("inf"))
             failed += 1

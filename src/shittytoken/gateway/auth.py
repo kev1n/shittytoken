@@ -87,22 +87,13 @@ async def auth_middleware(
 
     user_id: str = key_data["user_id"]
 
-    # ── Rate-limit checks (Redis) ────────────────────────────────────
-    rpm_limit = key_data.get("rate_limit_rpm", 60)
+    # ── Rate-limit check (Redis) ─────────────────────────────────────
+    rpm_limit = key_data.get("rate_limit_rpm", 1500)
     if not await billing_redis.check_rate_limit_rpm(key_hash, rpm_limit):
         logger.warning("auth.rate_limit_rpm", key_hash=key_hash[:12], limit=rpm_limit)
         raise web.HTTPTooManyRequests(
             text="Rate limit exceeded (RPM)",
             headers={"Retry-After": "5"},
-        )
-
-    tpm_limit = key_data.get("rate_limit_tpm", 100_000)
-    estimated_tokens = max(1, request.content_length or 0) // 4
-    if not await billing_redis.check_rate_limit_tpm(key_hash, tpm_limit, estimated_tokens):
-        logger.warning("auth.rate_limit_tpm", key_hash=key_hash[:12], limit=tpm_limit)
-        raise web.HTTPTooManyRequests(
-            text="Rate limit exceeded (TPM)",
-            headers={"Retry-After": "10"},
         )
 
     # ── Balance check (Redis atomic read) ────────────────────────────

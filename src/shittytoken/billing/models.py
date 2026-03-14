@@ -18,7 +18,7 @@ class ApiKey:
     key_hash: str  # SHA-256 of plaintext
     user_id: str
     name: str | None = None
-    rate_limit_rpm: int = 60
+    rate_limit_rpm: int = 1500
     rate_limit_tpm: int = 100_000
     is_active: bool = True
     created_at: datetime | None = None
@@ -66,7 +66,7 @@ class UsageEvent:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int  # computed
-    cost_cents: int
+    cost_cents: float  # fractional cents for sub-cent precision
     latency_ms: int
     request_id: str | None = None
     created_at: str | None = None  # ISO format

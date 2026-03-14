@@ -76,6 +76,7 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
         "--gpu-memory-utilization", str(config.gpu_memory_utilization),
         "--max-num-seqs", str(config.max_num_seqs),
         "--enable-prefix-caching",
+        "--enable-prompt-tokens-details",
         "--host", "0.0.0.0",
         "--port", str(worker_port),
         "--enable-auto-tool-choice",
@@ -311,6 +312,10 @@ class GPUProvider(abc.ABC):
     async def get_instance(self, instance_id: str) -> dict:
         """Get current instance status."""
 
+    @abc.abstractmethod
+    async def list_all_instances(self) -> list[dict]:
+        """List all instances currently rented by this account."""
+
 
 # ---------------------------------------------------------------------------
 # Vast.ai provider (uses vastai-sdk)
@@ -405,13 +410,26 @@ class VastAIProvider(GPUProvider):
     ) -> ProvisionedInstance:
         """
         Rent an instance via the SDK and poll until SSH is ready.
+        If volume_cache is enabled, attaches or creates a persistent volume
+        to cache model weights, torch.compile artifacts, and Triton kernels.
         """
         _vllm_cfg = cfg.get("vllm", {})
         docker_image = _vllm_cfg.get("docker_image", "vllm/vllm-openai:latest")
         if disk_gb is None:
             disk_gb = _vllm_cfg.get("disk_gb", 50)
 
+        vol_cfg = cfg.get("orchestrator", {}).get("volume_cache", {})
+        vol_enabled = vol_cfg.get("enabled", False)
+        mount_path = vol_cfg.get("mount_path", "/cache")
+
+        # Build env vars — redirect all caches to the volume mount if enabled
         env_parts = [f"-e HF_TOKEN={hf_token}"]
+        if vol_enabled:
+            env_parts += [
+                f"-e HF_HOME={mount_path}/huggingface",
+                f"-e VLLM_CACHE_ROOT={mount_path}/vllm",
+                f"-e TRITON_CACHE_DIR={mount_path}/triton",
+            ]
         for k, v in _vllm_cfg.get("env", {}).items():
             env_parts.append(f"-e {k}={v}")
         env_str = " ".join(env_parts)
@@ -430,6 +448,36 @@ class VastAIProvider(GPUProvider):
         else:
             startup_cmd = vllm_command
 
+        # Volume handling — check for existing volume on this machine
+        create_kwargs: dict[str, Any] = {}
+        if vol_enabled:
+            machine_id = offer.raw.get("machine_id")
+            if machine_id:
+                existing_vol = await self.find_volume_for_machine(machine_id)
+                if existing_vol:
+                    vol_id = existing_vol["id"]
+                    logger.info(
+                        "vastai_volume_reusing",
+                        volume_id=vol_id,
+                        machine_id=machine_id,
+                        disk_space=existing_vol.get("disk_space"),
+                    )
+                    create_kwargs["link_volume"] = vol_id
+                    create_kwargs["mount_path"] = mount_path
+                else:
+                    vol_size = vol_cfg.get("size_gb", 40)
+                    label = f"{vol_cfg.get('label_prefix', 'st-cache')}-{machine_id}"
+                    logger.info(
+                        "vastai_volume_creating",
+                        machine_id=machine_id,
+                        size_gb=vol_size,
+                        label=label,
+                    )
+                    create_kwargs["create_volume"] = int(offer.offer_id)
+                    create_kwargs["mount_path"] = mount_path
+                    create_kwargs["volume_size"] = vol_size
+                    create_kwargs["volume_label"] = label
+
         result = await asyncio.to_thread(
             self._client.create_instance,
             id=int(offer.offer_id),
@@ -439,6 +487,7 @@ class VastAIProvider(GPUProvider):
             direct=True,
             onstart_cmd=startup_cmd,
             env=env_str,
+            **create_kwargs,
         )
 
         logger.debug("vastai_create_instance_response", result=repr(result)[:500])
@@ -524,6 +573,87 @@ class VastAIProvider(GPUProvider):
             f"Vast.ai instance {instance_id} did not expose ssh_host within 600 s"
         )
 
+    # -- Volume management ---------------------------------------------------
+
+    async def list_volumes(self) -> list[dict]:
+        """List all owned volumes."""
+        result = await asyncio.to_thread(self._client.show_volumes)
+        if isinstance(result, list):
+            return result
+        return []
+
+    async def find_volume_for_machine(self, machine_id: int) -> dict | None:
+        """Find an existing shittytoken cache volume on a specific machine."""
+        vol_cfg = cfg.get("orchestrator", {}).get("volume_cache", {})
+        label_prefix = vol_cfg.get("label_prefix", "st-cache")
+
+        volumes = await self.list_volumes()
+        for vol in volumes:
+            if vol.get("machine_id") == machine_id:
+                label = vol.get("label", "") or ""
+                if label.startswith(label_prefix):
+                    return vol
+        return None
+
+    async def create_volume_on_machine(self, offer_id: int, size_gb: int, label: str) -> dict | None:
+        """Create a persistent volume from an offer (machine).
+
+        Uses the Vast.ai volume API: PUT /api/v0/volumes/ with {id, size}.
+        """
+        try:
+            result = await asyncio.to_thread(
+                self._client.create_volume,
+                id=offer_id,
+                size=size_gb,
+            )
+            logger.info("vastai_volume_created", offer_id=offer_id, size_gb=size_gb, label=label, result=repr(result)[:200])
+            return result if isinstance(result, dict) else {"success": True}
+        except Exception as exc:
+            logger.warning("vastai_volume_create_failed", offer_id=offer_id, error=str(exc))
+            return None
+
+    async def delete_volume(self, volume_id: int) -> None:
+        """Delete a persistent volume."""
+        try:
+            await asyncio.to_thread(self._client.delete_volume, id=volume_id)
+            logger.info("vastai_volume_deleted", volume_id=volume_id)
+        except Exception as exc:
+            logger.warning("vastai_volume_delete_failed", volume_id=volume_id, error=str(exc))
+
+    async def evict_stale_volumes(self, max_age_days: float) -> int:
+        """Delete volumes that haven't been used in max_age_days. Returns count deleted."""
+        import time as _time
+
+        vol_cfg = cfg.get("orchestrator", {}).get("volume_cache", {})
+        label_prefix = vol_cfg.get("label_prefix", "st-cache")
+        volumes = await self.list_volumes()
+        now = _time.time()
+        evicted = 0
+
+        for vol in volumes:
+            label = vol.get("label", "") or ""
+            if not label.startswith(label_prefix):
+                continue
+
+            # Use end_date (last use) or start_date as reference
+            # Vast.ai timestamps are epoch floats
+            last_used = vol.get("end_date") or vol.get("start_date") or 0
+            if isinstance(last_used, str):
+                continue  # skip unparseable
+            age_days = (now - last_used) / 86400.0
+            if age_days > max_age_days:
+                instances = vol.get("instances", [])
+                if instances:
+                    logger.debug("vastai_volume_evict_skip_attached", volume_id=vol["id"], instances=instances)
+                    continue
+                logger.info("vastai_volume_evicting", volume_id=vol["id"], age_days=round(age_days, 1), machine_id=vol.get("machine_id"))
+                await self.delete_volume(vol["id"])
+                evicted += 1
+
+        if evicted:
+            logger.info("vastai_volumes_evicted", count=evicted)
+        return evicted
+
     async def destroy_instance(self, instance_id: str) -> None:
         """Destroy an instance via the SDK."""
         await asyncio.to_thread(self._client.destroy_instance, id=int(instance_id))
@@ -545,6 +675,13 @@ class VastAIProvider(GPUProvider):
                 if str(inst.get("id")) == str(instance_id):
                     return inst
         return {}
+
+    async def list_all_instances(self) -> list[dict]:
+        """List all instances currently rented on this Vast.ai account."""
+        result = await asyncio.to_thread(self._client.show_instances)
+        if isinstance(result, list):
+            return result
+        return []
 
     @staticmethod
     def _to_gpu_offer(raw: dict) -> GPUOffer:
@@ -843,6 +980,26 @@ class RunPodProvider(GPUProvider):
         except Exception as exc:
             logger.warning("runpod_get_pod_failed", pod_id=instance_id, error=str(exc))
         return {}
+
+    async def list_all_instances(self) -> list[dict]:
+        """List all pods on this RunPod account."""
+        query = """
+        query {
+          myself {
+            pods {
+              id desiredStatus gpuCount costPerHr
+              machine { gpuDisplayName }
+            }
+          }
+        }
+        """
+        try:
+            data = await self._async_graphql(query)
+            pods = data.get("myself", {}).get("pods", [])
+            return pods if isinstance(pods, list) else []
+        except Exception as exc:
+            logger.warning("runpod_list_pods_failed", error=str(exc))
+            return []
 
     # -- Helpers -------------------------------------------------------------
 

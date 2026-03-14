@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash TEXT PRIMARY KEY,
     user_id UUID NOT NULL REFERENCES users(id),
     name TEXT,
-    rate_limit_rpm INTEGER NOT NULL DEFAULT 60,
+    rate_limit_rpm INTEGER NOT NULL DEFAULT 1500,
     rate_limit_tpm INTEGER NOT NULL DEFAULT 100000,
     is_active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -77,12 +77,15 @@ CREATE TABLE IF NOT EXISTS usage_events (
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
     total_tokens INTEGER NOT NULL,
-    cost_cents INTEGER NOT NULL,
+    cost_cents NUMERIC(12,6) NOT NULL,
     latency_ms INTEGER,
     request_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_user ON usage_events(user_id, created_at);
+
+-- Migration: change cost_cents from INTEGER to NUMERIC for sub-cent precision
+ALTER TABLE usage_events ALTER COLUMN cost_cents TYPE NUMERIC(12,6);
 """
 
 

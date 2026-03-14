@@ -143,7 +143,7 @@ class WorkerPool:
 
         parsed = parse_prometheus_text(text)
         requests_running = int(parsed.get("num_requests_running", 0))
-        kv_cache_pct = parsed.get("vllm:gpu_cache_usage_perc", 0.0)
+        kv_cache_pct = parsed.get("vllm:kv_cache_usage_perc", 0.0)
 
         self.report_metrics(url, requests_running, kv_cache_pct)
 
