@@ -36,8 +36,13 @@ async def auth_middleware(
     On success, sets ``request["user_id"]`` and ``request["key_hash"]`` for
     downstream handlers.
     """
-    # Skip auth for public / admin paths
-    if request.path in _PUBLIC_PATHS or request.path.startswith("/admin"):
+    # Skip auth for public paths
+    if request.path in _PUBLIC_PATHS:
+        return await handler(request)
+
+    # Admin paths require a valid admin token (checked per-handler via
+    # _check_admin_token in admin_api.py), not a Bearer API key.
+    if request.path.startswith("/admin"):
         return await handler(request)
 
     app = request.app

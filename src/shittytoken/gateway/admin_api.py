@@ -20,17 +20,30 @@ logger = structlog.get_logger()
 
 
 def _check_admin_token(request: web.Request) -> web.Response | None:
-    """Return a 403 Response if the admin token is invalid, else None."""
+    """Return a 403 Response if the admin token is invalid, else None.
+
+    When ``admin_token`` is not set, only requests from loopback (127.0.0.1 /
+    ::1) are allowed — this permits the orchestrator (same host) to push
+    metrics while blocking external access.
+    """
     expected: str | None = request.app.get("admin_token")
-    if expected is None:
-        return None  # dev mode — no auth
     provided = request.headers.get("X-Admin-Token")
-    if provided != expected:
+    if expected and provided == expected:
+        return None  # valid token
+    if expected and provided != expected:
         return web.json_response(
             {"error": {"message": "Forbidden: invalid admin token"}},
             status=403,
         )
-    return None
+    # No admin_token configured — restrict to loopback only
+    peername = request.transport.get_extra_info("peername") if request.transport else None
+    remote_ip = peername[0] if peername else ""
+    if remote_ip in ("127.0.0.1", "::1", ""):
+        return None
+    return web.json_response(
+        {"error": {"message": "Forbidden: admin endpoints require authentication"}},
+        status=403,
+    )
 
 
 async def add_worker(request: web.Request) -> web.Response:

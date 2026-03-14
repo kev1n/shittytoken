@@ -53,6 +53,24 @@ class InProcessPublisher:
     async def publish(self, event: UsageEvent) -> None:
         self._queue.put_nowait(event)
 
+    async def get(self, timeout: float = 1.0) -> UsageEvent | None:
+        """Get a single event, returning None on timeout."""
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def get_nowait(self) -> UsageEvent | None:
+        """Get a single event without blocking, returning None if empty."""
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    @property
+    def empty(self) -> bool:
+        return self._queue.empty()
+
     async def close(self) -> None:
         pass
 
@@ -68,19 +86,16 @@ class InProcessConsumer:
         while True:
             # Batch: drain up to 100 events, then process
             events: list[UsageEvent] = []
-            try:
-                event = await asyncio.wait_for(
-                    self._publisher._queue.get(), timeout=1.0
-                )
-                events.append(event)
-            except asyncio.TimeoutError:
+            event = await self._publisher.get(timeout=1.0)
+            if event is None:
                 continue
+            events.append(event)
             # Drain remaining without blocking
-            while not self._publisher._queue.empty() and len(events) < 100:
-                try:
-                    events.append(self._publisher._queue.get_nowait())
-                except asyncio.QueueEmpty:
+            while not self._publisher.empty and len(events) < 100:
+                evt = self._publisher.get_nowait()
+                if evt is None:
                     break
+                events.append(evt)
             for evt in events:
                 try:
                     await handler(evt)
@@ -258,26 +273,14 @@ class BillingPipeline:
         # 1. Record event
         await self._postgres.record_usage_event(event)
 
-        # 2. Accumulate fractional cents and deduct whole cents when threshold met.
-        #    Redis key "accum:{user_id}" holds the fractional remainder (float string).
-        accum_key = f"accum:{event.user_id}"
-        try:
-            prev = await self._redis._redis.get(accum_key)
-            accumulated = float(prev) if prev else 0.0
-        except (TypeError, ValueError):
-            accumulated = 0.0
-
-        accumulated += event.cost_cents
-        deduct_cents = int(accumulated)  # floor — only deduct whole cents
+        # 2. Atomically accumulate fractional cents via Lua script.
+        #    Returns whole cents to deduct (0 if still sub-cent).
+        deduct_cents = await self._redis.accumulate_and_deduct(
+            event.user_id, event.cost_cents
+        )
 
         if deduct_cents <= 0:
-            # Still sub-cent — save remainder and skip deduction
-            await self._redis._redis.set(accum_key, str(accumulated))
             return
-
-        # Save the fractional remainder
-        remainder = accumulated - deduct_cents
-        await self._redis._redis.set(accum_key, str(remainder))
 
         deducted = await self._postgres.deduct_credits_fifo(
             user_id=event.user_id,

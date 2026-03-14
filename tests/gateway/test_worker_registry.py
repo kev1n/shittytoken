@@ -13,7 +13,6 @@ import pytest
 
 from shittytoken.common.prometheus import parse_prometheus_text
 from shittytoken.gateway.worker_registry import (
-    CircuitBreakerState,
     WorkerEntry,
     WorkerRegistry,
 )
@@ -133,31 +132,6 @@ class TestRemoveWorker:
 
 
 # ---------------------------------------------------------------------------
-# update_circuit_state
-# ---------------------------------------------------------------------------
-
-
-class TestUpdateCircuitState:
-    async def test_update_circuit_state_changes_entry(self, registry):
-        await registry.add_worker("http://w1:8000")
-        registry.update_circuit_state("http://w1:8000", CircuitBreakerState.OPEN)
-        entry = registry.get_worker("http://w1:8000")
-        assert entry is not None
-        assert entry.circuit_state == CircuitBreakerState.OPEN
-
-    async def test_update_circuit_state_closed_to_half_open(self, registry):
-        await registry.add_worker("http://w1:8000")
-        registry.update_circuit_state("http://w1:8000", CircuitBreakerState.HALF_OPEN)
-        entry = registry.get_worker("http://w1:8000")
-        assert entry is not None
-        assert entry.circuit_state == CircuitBreakerState.HALF_OPEN
-
-    async def test_update_circuit_state_unknown_url_raises_key_error(self, registry):
-        with pytest.raises(KeyError):
-            registry.update_circuit_state("http://ghost:8000", CircuitBreakerState.OPEN)
-
-
-# ---------------------------------------------------------------------------
 # list_workers / get_worker
 # ---------------------------------------------------------------------------
 
@@ -187,17 +161,9 @@ class TestListAndGetWorkers:
 
 
 class TestWorkerEntryDefaults:
-    def test_default_circuit_state_is_closed(self):
-        entry = WorkerEntry(url="http://w1:8000", registered_at=time.time())
-        assert entry.circuit_state == CircuitBreakerState.CLOSED
-
     def test_default_not_draining(self):
         entry = WorkerEntry(url="http://w1:8000", registered_at=time.time())
         assert entry.draining is False
-
-    def test_default_consecutive_failures_zero(self):
-        entry = WorkerEntry(url="http://w1:8000", registered_at=time.time())
-        assert entry.consecutive_failures == 0
 
 
 # ---------------------------------------------------------------------------

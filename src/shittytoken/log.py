@@ -4,31 +4,67 @@ Structured JSON logging factory using structlog.
 Call configure_logging() once at process startup, then obtain loggers
 with get_logger(name).
 
-Logs go to both stderr (human-readable) and logs/orchestrator.log (JSON).
+Log layout:
+    logs/
+      orchestrator/
+        2026-03-14T04-21-50/       ← one dir per orchestrator run
+          orchestrator.log         ← main orchestrator log
+          worker-ssh2.vast.ai-28809.log  ← per-worker logs (future)
+      gateway/
+        2026-03-14T04-21-50/
+          gateway.log
+      stress-test/
+        2026-03-14T04-40-00.log
 """
 
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import structlog
 
 
-def configure_logging(log_dir: str | Path | None = None) -> None:
+def _make_run_dir(log_dir: Path, component: str) -> Path:
+    """Create a timestamped run directory under logs/<component>/."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    run_dir = log_dir / component / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Maintain a "latest" symlink for convenience
+    latest = log_dir / component / "latest"
+    try:
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(run_dir.name)
+    except OSError:
+        pass  # symlinks may fail on some systems
+
+    return run_dir
+
+
+def configure_logging(
+    log_dir: str | Path | None = None,
+    component: str = "orchestrator",
+) -> Path:
     """Configure structlog for dual output: console (stderr) + JSON file.
 
     Args:
-        log_dir: Directory for log files. Defaults to ``logs/`` in the
+        log_dir: Base directory for log files. Defaults to ``logs/`` in the
                  project root (next to config.yml).
+        component: Component name (orchestrator, gateway, etc.). Creates
+                   a timestamped subdirectory per run.
+
+    Returns:
+        Path to the run directory (for adding per-worker logs later).
     """
     if log_dir is None:
-        # Put logs next to config.yml
         from .config import _find_config_yml
         log_dir = _find_config_yml().parent / "logs"
     log_dir = Path(log_dir)
-    log_dir.mkdir(exist_ok=True)
 
-    log_file = log_dir / "orchestrator.log"
+    run_dir = _make_run_dir(log_dir, component)
+    log_file = run_dir / f"{component}.log"
 
     # stdlib root logger → file (JSON lines)
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
@@ -40,6 +76,8 @@ def configure_logging(log_dir: str | Path | None = None) -> None:
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
+    # Clear any handlers from previous configure_logging calls
+    root.handlers.clear()
     root.addHandler(file_handler)
     root.addHandler(console_handler)
 
@@ -83,6 +121,7 @@ def configure_logging(log_dir: str | Path | None = None) -> None:
     console_handler.setFormatter(console_formatter)
 
     structlog.get_logger().info("logging_configured", log_file=str(log_file))
+    return run_dir
 
 
 def get_logger(name: str | None = None):

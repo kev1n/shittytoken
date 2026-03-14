@@ -149,8 +149,7 @@ class TestInstanceDeathMonitor:
         """Vast.ai instance with status 'exited' should be cleaned up."""
         sm = _make_sm(provider="vastai", state=InstanceState.SERVING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.return_value = {"actual_status": "exited"}
 
@@ -165,8 +164,7 @@ class TestInstanceDeathMonitor:
                 instance_death_monitor(
                     provider=mock_provider,
                     instances=instances,
-                    idle_since=idle_since,
-                    last_running=last_running,
+                    snapshots=snapshots,
                     heartbeat_monitor=mock_heartbeat,
                     gateway=mock_gateway,
                     shutdown_event=shutdown_event,
@@ -190,8 +188,7 @@ class TestInstanceDeathMonitor:
         """Vast.ai instance with status 'running' should not be touched."""
         sm = _make_sm(provider="vastai", state=InstanceState.SERVING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.return_value = {"actual_status": "running"}
 
@@ -213,8 +210,7 @@ class TestInstanceDeathMonitor:
                     instance_death_monitor(
                         provider=mock_provider,
                         instances=instances,
-                        idle_since=idle_since,
-                        last_running=last_running,
+                        snapshots=snapshots,
                         heartbeat_monitor=mock_heartbeat,
                         gateway=mock_gateway,
                         shutdown_event=shutdown_event,
@@ -237,8 +233,7 @@ class TestInstanceDeathMonitor:
         """Vast.ai instance with status 'loading' should not be touched."""
         sm = _make_sm(provider="vastai", state=InstanceState.SERVING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.return_value = {"actual_status": "loading"}
 
@@ -258,8 +253,7 @@ class TestInstanceDeathMonitor:
                     instance_death_monitor(
                         provider=mock_provider,
                         instances=instances,
-                        idle_since=idle_since,
-                        last_running=last_running,
+                        snapshots=snapshots,
                         heartbeat_monitor=mock_heartbeat,
                         gateway=mock_gateway,
                         shutdown_event=shutdown_event,
@@ -281,8 +275,7 @@ class TestInstanceDeathMonitor:
         """RunPod spot eviction should still trigger cleanup (regression test)."""
         sm = _make_sm(provider="runpod", state=InstanceState.SERVING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.return_value = {
             "desiredStatus": "EXITED",
@@ -299,8 +292,7 @@ class TestInstanceDeathMonitor:
                 instance_death_monitor(
                     provider=mock_provider,
                     instances=instances,
-                    idle_since=idle_since,
-                    last_running=last_running,
+                    snapshots=snapshots,
                     heartbeat_monitor=mock_heartbeat,
                     gateway=mock_gateway,
                     shutdown_event=shutdown_event,
@@ -322,8 +314,7 @@ class TestInstanceDeathMonitor:
         """Empty dict from get_instance should trigger cleanup for any provider."""
         sm = _make_sm(provider="vastai", state=InstanceState.SERVING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.return_value = {}
 
@@ -337,8 +328,7 @@ class TestInstanceDeathMonitor:
                 instance_death_monitor(
                     provider=mock_provider,
                     instances=instances,
-                    idle_since=idle_since,
-                    last_running=last_running,
+                    snapshots=snapshots,
                     heartbeat_monitor=mock_heartbeat,
                     gateway=mock_gateway,
                     shutdown_event=shutdown_event,
@@ -360,8 +350,7 @@ class TestInstanceDeathMonitor:
         """Instance in PROVISIONING state should be skipped by the monitor."""
         sm = _make_sm(provider="vastai", state=InstanceState.PROVISIONING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.return_value = {"actual_status": "exited"}
 
@@ -381,8 +370,7 @@ class TestInstanceDeathMonitor:
                     instance_death_monitor(
                         provider=mock_provider,
                         instances=instances,
-                        idle_since=idle_since,
-                        last_running=last_running,
+                        snapshots=snapshots,
                         heartbeat_monitor=mock_heartbeat,
                         gateway=mock_gateway,
                         shutdown_event=shutdown_event,
@@ -406,8 +394,7 @@ class TestInstanceDeathMonitor:
         """provider.get_instance raising an exception should not crash the monitor."""
         sm = _make_sm(provider="vastai", state=InstanceState.SERVING)
         instances = {sm.record.instance_id: sm}
-        idle_since = {}
-        last_running = {}
+        snapshots = {}
 
         mock_provider.get_instance.side_effect = RuntimeError("API timeout")
 
@@ -427,8 +414,7 @@ class TestInstanceDeathMonitor:
                     instance_death_monitor(
                         provider=mock_provider,
                         instances=instances,
-                        idle_since=idle_since,
-                        last_running=last_running,
+                        snapshots=snapshots,
                         heartbeat_monitor=mock_heartbeat,
                         gateway=mock_gateway,
                         shutdown_event=shutdown_event,

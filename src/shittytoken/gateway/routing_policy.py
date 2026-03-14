@@ -21,42 +21,47 @@ class CacheAwarePolicy:
 
     def __init__(
         self,
-        overload_running: int = 32,
-        overload_cache_pct: float = 0.9,
         vnodes: int = 150,
+        epsilon: float = 0.25,
     ) -> None:
-        self.overload_running = overload_running
-        self.overload_cache_pct = overload_cache_pct
         self.vnodes = vnodes
+        self.epsilon = epsilon
 
         # Consistent hash ring: sorted list of (hash_int, worker_url).
         self._ring: list[tuple[int, str]] = []
         self._ring_keys: list[int] = []  # parallel sorted key list for bisect
+        self._ring_worker_urls: frozenset[str] = frozenset()  # tracks when to rebuild
 
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def compute_prefix_key(messages: list[dict]) -> str:
-        """SHA-256 of system_prompt + first_user_message.
+    def compute_prefix_key(
+        messages: list[dict],
+        key_hash: str | None = None,
+    ) -> str:
+        """SHA-256 of api_key_hash + system_prompt content.
 
-        ``messages[0]`` is typically the system prompt and ``messages[1]``
-        the first user message.  If fewer than two messages are provided
-        we hash whatever is available.
+        Hashes only the system/developer messages (the stable, cacheable
+        prefix).  When *key_hash* is provided it is prepended so that the
+        same system prompt from different API keys routes to the same
+        worker per-key, maximising vLLM prefix-cache hits.
 
         Returns the hex-digest string.
         """
-        parts: list[str] = []
-        for msg in messages[:2]:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                # Handle structured content blocks (e.g. [{"type":"text","text":"…"}])
-                content = " ".join(
-                    block.get("text", "") for block in content if isinstance(block, dict)
-                )
-            parts.append(str(content))
-        combined = "\n".join(parts)
+        system_parts: list[str] = []
+        for msg in messages:
+            if msg.get("role") in ("system", "developer"):
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        block.get("text", "") for block in content if isinstance(block, dict)
+                    )
+                system_parts.append(str(content))
+        combined = "\n".join(system_parts)
+        if key_hash:
+            combined = key_hash + "\n" + combined
         return hashlib.sha256(combined.encode()).hexdigest()
 
     def select(
@@ -64,34 +69,55 @@ class CacheAwarePolicy:
         prefix_key: str,
         workers: list[WorkerState],
     ) -> WorkerState:
-        """Pick the best worker for *prefix_key*.
+        """Pick the best worker for *prefix_key* using CHWBL.
 
-        1. Single worker — return it immediately.
-        2. Consistent-hash to the nearest ring node.
-        3. If the target is overloaded or unhealthy, fall back to the
-           least-loaded healthy worker.
-        4. If ALL workers are unhealthy, return the one with the fewest
-           running requests anyway.
+        Consistent Hashing with Bounded Loads: walk the ring from the
+        hash point and pick the first healthy worker whose load is below
+        ``mean_load * (1 + epsilon) + 1``.  Falls back to the least-loaded
+        healthy worker, then least-loaded overall.
         """
         if len(workers) == 1:
             return workers[0]
 
-        # Rebuild ring (cheap for typical pool sizes).
-        self._build_ring(workers)
+        # Only rebuild ring when the worker set changes.
+        current_urls = frozenset(w.url for w in workers)
+        if current_urls != self._ring_worker_urls:
+            self._build_ring(workers)
+            self._ring_worker_urls = current_urls
 
         url_to_worker = {w.url: w for w in workers}
-        target = url_to_worker[self._ring_lookup(prefix_key)]
 
-        if target.healthy and not self._is_overloaded(target):
+        def _load(w):
+            """Effective load: max of scraped metrics and local tracking."""
+            return max(w.requests_running, getattr(w, 'local_in_flight', 0))
+
+        mean_load = sum(_load(w) for w in workers) / len(workers)
+        load_bound = mean_load * (1 + self.epsilon) + 1  # +1 avoids 0-mean edge
+
+        # Primary target from consistent hash
+        target = url_to_worker[self._ring_lookup(prefix_key)]
+        if target.healthy and _load(target) <= load_bound:
             return target
 
-        # Fallback: least-loaded healthy worker.
-        healthy = [w for w in workers if w.healthy]
-        if healthy:
-            return min(healthy, key=lambda w: w.requests_running)
+        # Walk ring to find next worker under bound
+        h = self._hash(prefix_key)
+        idx = bisect.bisect_left(self._ring_keys, h)
+        seen: set[str] = set()
+        for _ in range(len(self._ring)):
+            if idx >= len(self._ring):
+                idx = 0
+            url = self._ring[idx][1]
+            if url not in seen:
+                seen.add(url)
+                candidate = url_to_worker[url]
+                if candidate.healthy and _load(candidate) <= load_bound:
+                    return candidate
+            idx += 1
 
-        # All unhealthy — pick fewest requests.
-        return min(workers, key=lambda w: w.requests_running)
+        # All above bound — least loaded healthy, then least loaded overall
+        healthy = [w for w in workers if w.healthy]
+        pool = healthy if healthy else workers
+        return min(pool, key=_load)
 
     # ------------------------------------------------------------------
     # Ring internals
@@ -115,12 +141,6 @@ class CacheAwarePolicy:
         if idx >= len(self._ring):
             idx = 0  # wrap around
         return self._ring[idx][1]
-
-    def _is_overloaded(self, worker: WorkerState) -> bool:
-        return (
-            worker.requests_running > self.overload_running
-            or worker.kv_cache_pct > self.overload_cache_pct
-        )
 
     @staticmethod
     def _hash(key: str) -> int:

@@ -22,6 +22,21 @@ local new_bal = redis.call('DECRBY', KEYS[1], cost)
 return {1, new_bal}
 """
 
+# Lua script for atomic accumulate-and-deduct.
+# Adds cost to an accumulator key, returns {deduct_whole_cents, new_remainder}.
+# Only deducts when accumulated value >= 1 cent.
+_ACCUMULATE_AND_DEDUCT_LUA = """
+local accum_key = KEYS[1]
+local cost = tonumber(ARGV[1])
+local prev = redis.call('GET', accum_key)
+local accumulated = prev and tonumber(prev) or 0
+accumulated = accumulated + cost
+local deduct = math.floor(accumulated)
+local remainder = accumulated - deduct
+redis.call('SET', accum_key, tostring(remainder))
+return {deduct, tostring(remainder)}
+"""
+
 
 class BillingRedis:
     """Redis hot-path for billing: balance checks, API key cache, rate limits.
@@ -37,6 +52,9 @@ class BillingRedis:
         self._redis = redis
         self._check_and_deduct_script = self._redis.register_script(
             _CHECK_AND_DEDUCT_LUA
+        )
+        self._accumulate_and_deduct_script = self._redis.register_script(
+            _ACCUMULATE_AND_DEDUCT_LUA
         )
 
     @classmethod
@@ -93,6 +111,21 @@ class BillingRedis:
         allowed = bool(result[0])
         balance = int(result[1])
         return allowed, balance
+
+    async def accumulate_and_deduct(
+        self, user_id: str, cost_cents: float
+    ) -> int:
+        """Atomically accumulate fractional cents and return whole cents to deduct.
+
+        Uses a Lua script so concurrent requests for the same user cannot
+        lose fractional updates.  Returns the number of whole cents to
+        deduct (may be 0 if still sub-cent).
+        """
+        result = await self._accumulate_and_deduct_script(
+            keys=[f"accum:{user_id}"],
+            args=[cost_cents],
+        )
+        return int(result[0])
 
     # ── API key cache ──────────────────────────────────────────────────
 

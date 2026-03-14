@@ -1,14 +1,19 @@
 """
-WorkerRegistry — active worker pool with circuit-breaker state and drain support.
+WorkerRegistry — orchestrator-side worker pool with drain support.
 
-All worker add/remove/list operations go through Python functions only —
-no shell scripts.  Pool changes trigger router_manager.reload() automatically.
+This registry lives in the **orchestrator process**.  It is the orchestrator's
+view of the worker set.  Changes are synced to the **router process**'s
+``WorkerPool`` via ``router_manager.reload()`` → admin HTTP API.
+
+The router's ``WorkerPool`` independently tracks per-worker health and load
+metrics (via ``/metrics`` scraping).  The two pools are in separate processes
+and intentionally maintain separate state.  The orchestrator drives lifecycle
+(add/remove/drain); the router drives request routing.
 """
 
 import asyncio
 import time
 from dataclasses import dataclass, field
-from enum import Enum
 
 import aiohttp
 import structlog
@@ -21,34 +26,26 @@ logger = structlog.get_logger()
 _DRAIN_POLL_INTERVAL_SEC = 5.0
 
 
-class CircuitBreakerState(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
 @dataclass
 class WorkerEntry:
     url: str
     registered_at: float
-    circuit_state: CircuitBreakerState = CircuitBreakerState.CLOSED
-    consecutive_failures: int = 0
-    last_health_check: float = 0.0
     draining: bool = False
 
 
 class WorkerRegistry:
     """
-    Manages the active worker pool.
+    Manages the active worker pool on the orchestrator side.
 
     Calling add_worker / remove_worker always triggers router_manager.reload()
-    so the vLLM Router reflects the new pool immediately.
+    so the router subprocess reflects the new pool immediately.
     """
 
-    def __init__(self, router_manager) -> None:  # type: RouterManager
+    def __init__(self, router_manager, session: aiohttp.ClientSession | None = None) -> None:
         self._router_manager = router_manager
         self._workers: dict[str, WorkerEntry] = {}
         self._lock = asyncio.Lock()
+        self._session = session  # shared session for drain polling
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,18 +106,6 @@ class WorkerRegistry:
     def get_worker(self, url: str) -> WorkerEntry | None:
         return self._workers.get(url)
 
-    def update_circuit_state(self, url: str, state: CircuitBreakerState) -> None:
-        """
-        Update the circuit-breaker state for *url*.
-
-        Raises KeyError if *url* is not registered.
-        """
-        entry = self._workers.get(url)
-        if entry is None:
-            raise KeyError(f"Worker not found: {url}")
-        entry.circuit_state = state
-        logger.info("circuit_state_changed", url=url, state=state)
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -138,14 +123,15 @@ class WorkerRegistry:
         Poll {url}/metrics every 5 seconds.  Stop when num_requests_running
         reaches 0 or *timeout_sec* elapses.  After timeout, proceed anyway so
         the caller can still remove the worker.
-
-        Uses inline Prometheus text parsing — no external dependencies.
         """
         deadline = time.monotonic() + timeout_sec
         log = logger.bind(url=url)
         log.info("drain_poll_started", timeout_sec=timeout_sec)
 
-        async with aiohttp.ClientSession() as session:
+        # Use the shared session if available, otherwise create one
+        own_session = self._session is None
+        session = self._session or aiohttp.ClientSession()
+        try:
             while time.monotonic() < deadline:
                 running = await self._fetch_requests_running(session, url)
                 if running is not None and running == 0:
@@ -157,6 +143,9 @@ class WorkerRegistry:
                     remaining_sec=round(deadline - time.monotonic(), 1),
                 )
                 await asyncio.sleep(_DRAIN_POLL_INTERVAL_SEC)
+        finally:
+            if own_session:
+                await session.close()
 
         log.warning("drain_timeout", timeout_sec=timeout_sec, action="proceeding_anyway")
 

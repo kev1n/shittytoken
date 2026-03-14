@@ -68,12 +68,8 @@ async def _handle_checkout_completed(
     pg: BillingPostgres = request.app["billing_pg"]
     redis: BillingRedis = request.app["billing_redis"]
 
-    # Idempotency: check if we already credited this payment
-    existing_blocks = await pg.get_active_blocks(user_id)
-    already_credited = any(
-        b.stripe_payment_intent_id == payment_intent_id
-        for b in existing_blocks
-    )
+    # Idempotency: check ALL blocks (including exhausted/expired)
+    already_credited = await pg.has_credit_block_for_payment(payment_intent_id)
 
     if already_credited:
         logger.info(

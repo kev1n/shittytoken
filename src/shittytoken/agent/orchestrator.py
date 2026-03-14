@@ -5,9 +5,8 @@ Lifecycle:
 1. Startup: restore any previously registered workers from KnowledgeGraph.
 2. Main loop (every metrics_poll_interval_s):
    a. Scrape aggregate metrics from all SERVING workers.
-   b. Scale up if total_requests_waiting > scale_up_waiting_threshold.
-   c. Scale down if a worker has been idle (0 requests) for scale_down_idle_seconds
-      AND avg_kv_cache_usage < scale_down_cache_max.
+   b. Scale up if all workers are saturated, preemptions spike, or queue time is high.
+   c. Scale down if a specific worker has been idle long enough and its cache is cold.
 3. SIGTERM: drain all workers, terminate all instances, exit cleanly.
 
 Scale-up flow:
@@ -43,6 +42,78 @@ from .state_store import RedisStateStore
 logger = structlog.get_logger()
 
 
+# ---------------------------------------------------------------------------
+# Per-worker metrics snapshot (replaces N separate dicts)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field as dc_field
+
+
+@dataclass
+class WorkerSnapshot:
+    """All per-worker metrics the orchestrator tracks between ticks.
+
+    One instance per serving worker, keyed by instance_id in
+    ``Orchestrator._snapshots``.  Adding a new metric means adding a
+    field here — no extra dicts, no extra cleanup code.
+    """
+    # Gauges (latest value)
+    requests_running: int = 0
+    kv_cache_pct: float = 0.0
+
+    # Counters (cumulative — use deltas between ticks for rates)
+    prefix_cache_hits: float = 0.0
+    prefix_cache_queries: float = 0.0
+    preemptions_total: float = 0.0
+    prompt_tokens_total: float = 0.0
+    generation_tokens_total: float = 0.0
+
+    # Histogram sum/count pairs (cumulative — delta gives per-interval avg)
+    ttft_sum: float = 0.0
+    ttft_count: float = 0.0
+    itl_sum: float = 0.0
+    itl_count: float = 0.0
+    queue_time_sum: float = 0.0
+    queue_time_count: float = 0.0
+
+    # Idle tracking
+    idle_since: float | None = None  # monotonic timestamp when became idle
+
+
+# ---------------------------------------------------------------------------
+# Data-driven scale-up triggers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScaleTrigger:
+    """A single scale-up condition, evaluated each tick."""
+    name: str
+    check: object  # Callable[[TickContext], bool]
+    sustain_ticks: int = 1  # how many consecutive True ticks before firing
+    _consecutive: int = dc_field(default=0, repr=False)
+
+    def evaluate(self, ctx: "TickContext") -> bool:
+        if self.check(ctx):
+            self._consecutive += 1
+        else:
+            self._consecutive = 0
+        return self._consecutive >= self.sustain_ticks
+
+    def reset(self) -> None:
+        self._consecutive = 0
+
+
+@dataclass
+class TickContext:
+    """All data available to scale triggers on a given tick."""
+    metrics: AggregateMetrics
+    preemptions_delta: float
+    gen_tokens_delta: float
+    avg_queue_time_delta: float  # avg queue wait (seconds) this tick across workers
+    min_requests_waiting: int    # min requests_waiting across all serving workers
+    cfg: dict  # orchestrator config section
+
+
 class Orchestrator:
     """
     Autonomous GPU instance lifecycle manager.
@@ -67,10 +138,11 @@ class Orchestrator:
 
         # instance_id → InstanceStateMachine
         self._instances: dict[str, InstanceStateMachine] = {}
-        # instance_id → last_idle timestamp (monotonic)
-        self._idle_since: dict[str, float] = {}
-        # instance_id → last known running-request count
-        self._last_running: dict[str, int] = {}
+
+        # Consolidated per-worker metrics: instance_id → WorkerSnapshot
+        self._snapshots: dict[str, WorkerSnapshot] = {}
+        # Previous tick's snapshots for delta computation
+        self._prev_snapshots: dict[str, WorkerSnapshot] = {}
 
         self._cost_tracker = CostTracker()
 
@@ -86,6 +158,39 @@ class Orchestrator:
         self._provision_cooldown_until: float = 0.0
         self._scale_events: dict[str, int] = {"scale_up": 0, "scale_down": 0}
 
+        # Workers that failed their last metrics scrape
+        self._unreachable_workers: set[str] = set()
+
+        # Hysteresis: timestamp of last scale-up completion
+        self._last_scale_up_at: float = 0.0
+
+        # Reference to the gateway's worker pool for health checks
+        self._worker_pool = None  # set in run() if available
+
+        # Data-driven scale-up triggers — add new ones here
+        self._scale_triggers: list[ScaleTrigger] = [
+            ScaleTrigger(
+                name="all_workers_saturated",
+                # Every worker has waiting requests AND is near capacity
+                # (running >= threshold per worker). max_num_seqs is 16,
+                # optimal throughput around 10 concurrent requests.
+                check=lambda ctx: (
+                    ctx.min_requests_waiting > 0
+                    and ctx.metrics.total_requests_running >= ctx.metrics.worker_count * ctx.cfg.get("saturation_running_threshold", 10)
+                ),
+                sustain_ticks=2,
+            ),
+            ScaleTrigger(
+                name="preemptions",
+                check=lambda ctx: ctx.preemptions_delta > ctx.cfg.get("scale_up_preemption_threshold", 2),
+            ),
+            ScaleTrigger(
+                name="queue_time",
+                check=lambda ctx: ctx.avg_queue_time_delta > ctx.cfg.get("scale_up_queue_time_threshold_s", 2.0),
+                sustain_ticks=2,  # sustained high queue wait, not just one long prompt
+            ),
+        ]
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -93,6 +198,9 @@ class Orchestrator:
     async def run(self) -> None:
         """Main control loop. Runs until SIGTERM or _shutdown_event is set."""
         self._session = aiohttp.ClientSession()
+        # Share session with worker registry for drain polling
+        if hasattr(self._gateway, '_registry'):
+            self._gateway._registry._session = self._session
         self._ssh_manager = SSHManager(
             private_key_path=self._settings.ssh_private_key_path,
             keepalive_interval=cfg["ssh"]["keepalive_interval"],
@@ -110,8 +218,7 @@ class Orchestrator:
             spot_eviction_monitor(
                 provider=self._get_provider(),
                 instances=self._instances,
-                idle_since=self._idle_since,
-                last_running=self._last_running,
+                snapshots=self._snapshots,
                 heartbeat_monitor=self._heartbeat_monitor,
                 gateway=self._gateway,
                 shutdown_event=self._shutdown_event,
@@ -192,42 +299,115 @@ class Orchestrator:
             avg_kv_cache=round(metrics.avg_kv_cache_usage, 3),
         )
 
-        # Scrape per-worker metrics concurrently
-        serving_sms = [
-            sm for sm in self._instances.values()
-            if sm.state == InstanceState.SERVING and sm.record.worker_url
-        ]
-        if serving_sms:
-            scrape_results = await asyncio.gather(
-                *(scrape_worker_metrics(sm.record.worker_url, self._session) for sm in serving_sms),
-                return_exceptions=True,
-            )
-            for sm, result in zip(serving_sms, scrape_results):
-                if isinstance(result, Exception):
-                    continue
-                running = int(result.get("num_requests_running", 0))
-                self._last_running[sm.record.instance_id] = running
+        # ── Update per-worker snapshots ──────────────────────────────────
+        self._unreachable_workers.clear()
+        self._prev_snapshots = dict(self._snapshots)  # save for delta computation
+        url_to_iid: dict[str, str] = {}
 
-        # Update idle tracking per instance
+        if metrics.per_worker:
+            url_to_iid = {
+                sm.record.worker_url: sm.record.instance_id
+                for sm in self._instances.values()
+                if sm.state == InstanceState.SERVING and sm.record.worker_url
+            }
+            for wm in metrics.per_worker:
+                if not wm.reachable:
+                    self._unreachable_workers.add(wm.url)
+                iid = url_to_iid.get(wm.url)
+                if iid:
+                    snap = self._snapshots.get(iid, WorkerSnapshot())
+                    snap.requests_running = wm.requests_running
+                    snap.kv_cache_pct = wm.kv_cache_pct
+                    snap.prefix_cache_hits = wm.prefix_cache_hits
+                    snap.prefix_cache_queries = wm.prefix_cache_queries
+                    snap.preemptions_total = wm.preemptions_total
+                    snap.prompt_tokens_total = wm.prompt_tokens_total
+                    snap.generation_tokens_total = wm.generation_tokens_total
+                    snap.ttft_sum = wm.ttft_sum
+                    snap.ttft_count = wm.ttft_count
+                    snap.itl_sum = wm.itl_sum
+                    snap.itl_count = wm.itl_count
+                    snap.queue_time_sum = wm.queue_time_sum
+                    snap.queue_time_count = wm.queue_time_count
+                    self._snapshots[iid] = snap
+
+        # ── Compute aggregate deltas ─────────────────────────────────────
+        total_preemptions_delta = 0.0
+        total_gen_tokens_delta = 0.0
+        queue_time_delta_sum = 0.0
+        queue_time_delta_count = 0.0
+        for iid, snap in self._snapshots.items():
+            prev = self._prev_snapshots.get(iid)
+            if prev is None:
+                continue
+            if snap.preemptions_total > prev.preemptions_total:
+                total_preemptions_delta += snap.preemptions_total - prev.preemptions_total
+            if snap.generation_tokens_total > prev.generation_tokens_total:
+                total_gen_tokens_delta += snap.generation_tokens_total - prev.generation_tokens_total
+            # Queue time delta: compute avg queue wait for requests completed this tick
+            qt_sum_delta = snap.queue_time_sum - prev.queue_time_sum
+            qt_count_delta = snap.queue_time_count - prev.queue_time_count
+            if qt_count_delta > 0 and qt_sum_delta >= 0:
+                queue_time_delta_sum += qt_sum_delta
+                queue_time_delta_count += qt_count_delta
+        avg_queue_time_delta = queue_time_delta_sum / queue_time_delta_count if queue_time_delta_count > 0 else 0.0
+
+        # Min requests_waiting across all serving workers (for all_workers_saturated trigger)
+        min_requests_waiting = 0
+        if metrics.per_worker:
+            waiting_values = [wm.requests_waiting for wm in metrics.per_worker if wm.reachable]
+            min_requests_waiting = min(waiting_values) if waiting_values else 0
+
+        # ── Update idle tracking ─────────────────────────────────────────
         now = time.monotonic()
         for sm in self._instances.values():
             if sm.state != InstanceState.SERVING:
                 continue
             iid = sm.record.instance_id
-            running = self._last_running.get(iid, 1)
+            snap = self._snapshots.get(iid)
+            running = snap.requests_running if snap else 1
             if running == 0:
-                self._idle_since.setdefault(iid, now)
-            else:
-                self._idle_since.pop(iid, None)
+                if snap and snap.idle_since is None:
+                    snap.idle_since = now
+            elif snap:
+                snap.idle_since = None
 
-        # Scale up
+        # ── Scale up — data-driven triggers ──────────────────────────────
         _orch = cfg["orchestrator"]
-        if metrics.total_requests_waiting > _orch["scale_up_waiting_threshold"]:
+        max_workers = _orch.get("max_workers", 10)
+
+        ctx = TickContext(
+            metrics=metrics,
+            preemptions_delta=total_preemptions_delta,
+            gen_tokens_delta=total_gen_tokens_delta,
+            avg_queue_time_delta=avg_queue_time_delta,
+            min_requests_waiting=min_requests_waiting,
+            cfg=_orch,
+        )
+
+        fired_triggers = [t for t in self._scale_triggers if t.evaluate(ctx)]
+
+        # Check if any workers are unhealthy (recovering from crash).
+        unhealthy_workers = self._get_unhealthy_workers()
+        if unhealthy_workers:
+            logger.info(
+                "scale_up_deferred_unhealthy",
+                unhealthy=unhealthy_workers,
+                waiting=metrics.total_requests_waiting,
+            )
+            fired_triggers = []
+
+        if fired_triggers and len(serving_urls) < max_workers:
             if not self._provision_lock.locked():
+                reason = fired_triggers[0].name  # first firing trigger is the reason
                 logger.info(
                     "scale_up_triggered",
-                    waiting=metrics.total_requests_waiting,
-                    threshold=_orch["scale_up_waiting_threshold"],
+                    reason=reason,
+                    all_triggers=[t.name for t in fired_triggers],
+                    min_waiting=min_requests_waiting,
+                    total_waiting=metrics.total_requests_waiting,
+                    preemptions_delta=total_preemptions_delta,
+                    avg_queue_time=round(avg_queue_time_delta, 3),
                 )
                 self._scale_events["scale_up"] += 1
                 self._provision_task = asyncio.create_task(self._guarded_provision())
@@ -240,6 +420,29 @@ class Orchestrator:
         await self._maybe_evict_volumes()
         self._cost_tracker.maybe_log_summary()
         await self._push_metrics_to_gateway()
+
+    def _get_unhealthy_workers(self) -> list[str]:
+        """Return URLs of SERVING workers that are currently unreachable.
+
+        Checks two signals:
+        1. Heartbeat monitor consecutive failures (health endpoint down)
+        2. Metrics scrape reachability (from last _tick's aggregate_metrics)
+        """
+        unhealthy = []
+        for sm in self._instances.values():
+            if sm.state != InstanceState.SERVING or not sm.record.worker_url:
+                continue
+            url = sm.record.worker_url
+            # Check heartbeat failures
+            if self._heartbeat_monitor is not None:
+                failures = self._heartbeat_monitor.get_consecutive_failures(url)
+                if failures >= 1:
+                    unhealthy.append(url)
+                    continue
+            # Check last metrics scrape reachability
+            if url in self._unreachable_workers:
+                unhealthy.append(url)
+        return unhealthy
 
     # ------------------------------------------------------------------
     # Provisioning
@@ -265,6 +468,7 @@ class Orchestrator:
                     await self._save_state(record)
                     if record.cost_per_hour_usd:
                         self._cost_tracker.register(record.instance_id, record.cost_per_hour_usd)
+                    self._last_scale_up_at = time.monotonic()
                 elif sm is not None:
                     # Instance was created but qualification failed — destroy it
                     await self._destroy_instance(sm.record, sm)
@@ -478,53 +682,58 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     async def _maybe_scale_down(self, metrics: AggregateMetrics) -> None:
-        """Scale down if a worker has been idle long enough and KV cache is low."""
+        """Scale down if a worker has been idle long enough and its KV cache is low.
+
+        Uses per-worker cache metrics (not global average) and hysteresis
+        to prevent flapping with recent scale-ups.
+        """
         now = time.monotonic()
         idle_threshold = cfg["orchestrator"]["scale_down_idle_seconds"]
+        cache_max = cfg["orchestrator"]["scale_down_cache_max"]
 
+        # Hysteresis: don't scale down within 5 min of last scale-up
+        if now < self._last_scale_up_at + 300:
+            return
+
+        candidates = []
         for sm in list(self._instances.values()):
             if sm.state != InstanceState.SERVING:
                 continue
             iid = sm.record.instance_id
-            idle_start = self._idle_since.get(iid)
-            if idle_start is None:
+            snap = self._snapshots.get(iid)
+            if snap is None or snap.idle_since is None:
                 continue
-            idle_secs = now - idle_start
-            if (
-                idle_secs >= idle_threshold
-                and metrics.avg_kv_cache_usage < cfg["orchestrator"]["scale_down_cache_max"]
-            ):
-                logger.info(
-                    "scale_down_triggered",
-                    instance_id=iid,
-                    idle_secs=round(idle_secs, 1),
-                    avg_kv_cache=round(metrics.avg_kv_cache_usage, 3),
-                )
-                self._scale_events["scale_down"] += 1
-                await self._scale_down_one()
-                return
+            idle_secs = now - snap.idle_since
+            if idle_secs < idle_threshold:
+                continue
+            if snap.kv_cache_pct < cache_max:
+                candidates.append((sm, idle_secs, snap))
 
-    async def _scale_down_one(self) -> None:
-        """Select the least-utilized SERVING worker and deregister + destroy it."""
-        candidates = [
-            sm for sm in self._instances.values()
-            if sm.state == InstanceState.SERVING and sm.record.worker_url
-        ]
         if not candidates:
-            logger.info("scale_down_no_candidates")
             return
 
-        target_sm = min(
+        # Pick the least-valuable worker: lowest prefix cache hit count, then fewest requests
+        target_sm, idle_secs, snap = min(
             candidates,
-            key=lambda sm: self._last_running.get(sm.record.instance_id, 0),
+            key=lambda t: (t[2].prefix_cache_hits, t[2].requests_running),
         )
+        logger.info(
+            "scale_down_triggered",
+            instance_id=target_sm.record.instance_id,
+            idle_secs=round(idle_secs, 1),
+            worker_kv_cache=round(snap.kv_cache_pct, 3),
+            cache_hits=snap.prefix_cache_hits,
+        )
+        self._scale_events["scale_down"] += 1
+        await self._scale_down_one(target_sm)
+
+    async def _scale_down_one(self, target_sm: InstanceStateMachine) -> None:
+        """Deregister and destroy the selected worker."""
         record = target_sm.record
 
-        logger.info(
-            "scale_down_selected",
-            instance_id=record.instance_id,
-            worker_url=record.worker_url,
-        )
+        if target_sm.state != InstanceState.SERVING or not record.worker_url:
+            logger.info("scale_down_no_candidates")
+            return
 
         target_sm.transition(InstanceState.DRAINING, reason="scale_down")
         self._heartbeat_monitor.deregister(record.worker_url)
@@ -639,8 +848,8 @@ class Orchestrator:
             sm.transition(InstanceState.TERMINATED, reason="instance_destroyed")
 
         self._instances.pop(record.instance_id, None)
-        self._idle_since.pop(record.instance_id, None)
-        self._last_running.pop(record.instance_id, None)
+        self._snapshots.pop(record.instance_id, None)
+        self._prev_snapshots.pop(record.instance_id, None)
         await self._delete_state(record.instance_id)
 
     async def _on_worker_failure(self, url: str) -> None:
@@ -693,11 +902,11 @@ async def main() -> None:
     from ..gateway.router_manager import RouterManager
     from ..gateway.worker_registry import WorkerRegistry
 
-    configure_logging()
+    run_dir = configure_logging(component="orchestrator")
     log = structlog.get_logger()
 
     settings = Settings()
-    log.info("orchestrator_main_starting", neo4j_uri=settings.neo4j_uri)
+    log.info("orchestrator_main_starting", neo4j_uri=settings.neo4j_uri, run_dir=str(run_dir))
 
     kg = KnowledgeGraph(
         uri=settings.neo4j_uri,

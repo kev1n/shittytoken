@@ -52,6 +52,13 @@ async def create_web_app(
 ) -> web.Application:
     """Build and return the aiohttp web application."""
     settings = Settings()
+
+    if not settings.web_session_secret:
+        raise RuntimeError(
+            "WEB_SESSION_SECRET must be set (non-empty) in the environment or .env file. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+
     app = web.Application()
 
     # Store config for startup hook

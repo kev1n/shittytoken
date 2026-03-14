@@ -164,7 +164,6 @@ async def dashboard(request: web.Request) -> dict:
     session = await get_session(request)
     user_id = session["user_id"]
     pg = _billing_pg(request)
-    redis = _billing_redis(request)
 
     balance = await pg.get_balance(user_id)
     api_keys = await pg.list_api_keys_for_user(user_id)
@@ -311,8 +310,13 @@ async def billing_topup(request: web.Request) -> web.Response:
 
 
 @login_required
-@aiohttp_jinja2.template("billing.html")
-async def billing_success(request: web.Request) -> dict:
+async def billing_success(request: web.Request) -> web.Response:
+    """Handle Stripe checkout success redirect.
+
+    Credit fulfillment is handled by the Stripe webhook (stripe_webhook.py),
+    NOT here.  This endpoint only verifies the session is valid and shows a
+    confirmation message.  This prevents double-crediting from URL replays.
+    """
     session = await get_session(request)
     user_id = session["user_id"]
     checkout_session_id = request.query.get("session_id")
@@ -335,7 +339,6 @@ async def billing_success(request: web.Request) -> dict:
         _flash(session, "error", "Payment not completed.")
         raise web.HTTPFound("/billing")
 
-    # Check metadata to prevent double-credit
     meta_user_id = cs.metadata.get("user_id", "")
     amount_cents = int(cs.metadata.get("amount_cents", "0"))
 
@@ -343,29 +346,7 @@ async def billing_success(request: web.Request) -> dict:
         _flash(session, "error", "Payment verification failed.")
         raise web.HTTPFound("/billing")
 
-    pg = _billing_pg(request)
-    redis = _billing_redis(request)
-
-    # Add credit block (idempotent check via stripe_payment_intent_id)
-    payment_intent_id = cs.payment_intent
-    existing_blocks = await pg.get_active_blocks(user_id)
-    already_credited = any(
-        b.stripe_payment_intent_id == payment_intent_id
-        for b in existing_blocks
-    )
-
-    if not already_credited:
-        await pg.create_credit_block(
-            user_id=user_id,
-            amount_cents=amount_cents,
-            source="stripe_checkout",
-            stripe_payment_intent_id=payment_intent_id,
-        )
-        # Update Redis cache
-        new_balance = await pg.get_balance(user_id)
-        await redis.set_balance(user_id, new_balance)
-
-    _flash(session, "success", f"Payment received! ${amount_cents / 100:.2f} added to your balance.")
+    _flash(session, "success", f"Payment received! ${amount_cents / 100:.2f} will be added to your balance shortly.")
     raise web.HTTPFound("/billing")
 
 

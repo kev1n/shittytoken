@@ -132,7 +132,7 @@ class MetricsCollector:
             phase=self._current_phase,
             prefix_cache_queries=parsed.get("vllm:prefix_cache_queries_total", 0.0),
             prefix_cache_hits=parsed.get("vllm:prefix_cache_hits_total", 0.0),
-            kv_cache_usage_perc=parsed.get("vllm:gpu_cache_usage_perc", 0.0),
+            kv_cache_usage_perc=parsed.get("vllm:kv_cache_usage_perc", parsed.get("vllm:gpu_cache_usage_perc", 0.0)),
             num_requests_running=parsed.get("vllm:num_requests_running", 0.0),
             num_requests_waiting=parsed.get("vllm:num_requests_waiting", 0.0),
         )

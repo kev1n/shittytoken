@@ -46,7 +46,7 @@ vllm:
   defaults:
     tensor_parallel_size: 2
     max_model_len: 200000
-    gpu_memory_utilization: 0.92
+    gpu_memory_utilization: 0.93  # max stable on 2x RTX 3090 (0.94 crashes with CUDA assertion)
     quantization: null # let vLLM auto-detect from model config
     kv_cache_dtype: "fp8_e4m3"
     max_num_seqs: 16
@@ -63,17 +63,6 @@ vllm:
   # pip packages to install before starting vLLM
   pre_install:
     - "fastsafetensors"
-    - "lmcache"
-
-  # LMCache — CPU RAM KV cache offloading.
-  # Spills evicted KV cache entries to host CPU RAM so they can be reloaded
-  # instead of recomputed. max_cpu_size_gb is auto-detected from the machine's
-  # available RAM if set to "auto" (leaves a reserve for OS + vLLM overhead).
-  lmcache:
-    enabled: true
-    chunk_size: 256
-    max_cpu_size_gb: "auto"     # or a fixed number like 32.0
-    cpu_reserve_gb: 10.0        # RAM to leave free when auto-detecting
 
   # Extra CLI flags passed directly to vllm serve
   extra_args:
@@ -82,7 +71,7 @@ vllm:
     - "--max-num-batched-tokens"
     - "8192"
     - "--optimization-level"
-    - "3"
+    - "2"
     - "--performance-mode"
     - "throughput"
     - "--mamba-cache-mode"
@@ -93,8 +82,6 @@ vllm:
   # Environment variables set on the container
   env:
     VLLM_USE_DEEP_GEMM: "0"
-    VLLM_USE_FLASHINFER_MOE_FP16: "1"
-    VLLM_USE_FLASHINFER_SAMPLER: "0"
 
 # ── Gateway ─────────────────────────────────────────────────────────────────
 gateway:
@@ -102,6 +89,7 @@ gateway:
     port: 8001
     metrics_port: 29000
     policy: "cache_aware"
+    bounded_load_epsilon: 0.25 # CHWBL epsilon for load-bounded overflow
     health_check_timeout_sec: 30.0
 
   nginx:
@@ -121,8 +109,8 @@ gateway:
     # Defaults: input=2.5 ($0.025/1M), output=15.0 ($0.15/1M)
     pricing:
       default:
-        input_per_1m: 2.5    # $0.025 per 1M input tokens
-        output_per_1m: 15.0  # $0.15 per 1M output tokens
+        input_per_1m: 2.5 # $0.025 per 1M input tokens
+        output_per_1m: 15.0 # $0.15 per 1M output tokens
       # Per-model overrides:
       # "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit":
       #   input_per_1m: 2.5
@@ -133,35 +121,51 @@ gateway:
 
 # ── Orchestrator ────────────────────────────────────────────────────────────
 orchestrator:
-  redis_url: "redis://localhost:6379/0"  # shared with billing
+  redis_url: "redis://localhost:6379/0" # shared with billing
   provider: vastai # vastai | runpod
   min_workers: 1
-  scale_up_waiting_threshold: 10
+  max_workers: 5
+  # Scale-up triggers (any one fires → provision new worker):
+  # all_workers_saturated: min(requests_waiting) > 0 for 2 ticks (20s) — every worker is full
+  # preemptions: delta > threshold per tick — requests evicted mid-generation
+  # queue_time: avg vLLM scheduler wait > threshold for 2 ticks — real queuing, not long prefills
+  saturation_running_threshold: 10  # requests_running per worker before "saturated" (max_num_seqs is 16)
+  scale_up_preemption_threshold: 2
+  scale_up_queue_time_threshold_s: 2.0
   scale_down_idle_seconds: 300
-  scale_down_cache_max: 0.50
+  scale_down_cache_max: 0.30 # per-worker KV cache threshold (preserve warm caches)
   metrics_poll_interval_s: 10
   health_check_interval_s: 30
   health_failure_threshold: 3
   startup_monitor_timeout_s: 1200
   provision_cooldown_s: 60
-  stuck_instance_timeout_s: 1320  # startup_monitor_timeout_s + 120
+  stuck_instance_timeout_s: 1320 # startup_monitor_timeout_s + 120
   ssh_ready_timeout_s: 600 # max time to wait for SSH after renting
   instance_poll_interval_sec: 15
 
   # Persistent volume cache — caches model weights, torch.compile artifacts,
-  # and Triton kernels on a Vast.ai volume tied to the physical machine.
+  # Triton kernels, FlashInfer kernels, PyTorch extensions, and pip wheels
+  # on a Vast.ai volume tied to the physical machine.
   # Volumes are machine-local: they only help when re-renting the same machine.
   volume_cache:
     enabled: true
     mount_path: "/cache"
-    size_gb: 40
-    eviction_days: 3          # delete volumes unused for this many days
-    label_prefix: "stcache"  # volume label prefix (alphanumeric only, Vast.ai requirement)
+    size_gb: 30
+    eviction_days: 3 # delete volumes unused for this many days
+    label_prefix: "stcache" # volume label prefix (alphanumeric only, Vast.ai requirement)
 
   # RunPod-specific settings (spot only)
   runpod:
     cloud_type: SECURE # COMMUNITY | SECURE | ALL
     spot_poll_interval_sec: 10
+    # Network volume — persistent NVMe storage shared across pods in a datacenter.
+    # Only available on Secure Cloud. Caches model weights, compiled kernels, etc.
+    network_volume:
+      enabled: true
+      datacenter_id: "EU-RO-1"  # must match where your pods deploy
+      size_gb: 50
+      name_prefix: "shittytoken"  # volumes named {prefix}-{datacenter_id}
+      mount_path: "/workspace"  # RunPod default for network volumes
 
 # ── SSH ─────────────────────────────────────────────────────────────────────
 ssh:

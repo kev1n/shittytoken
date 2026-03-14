@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 import structlog
@@ -46,15 +47,14 @@ async def instance_death_monitor(
     *,
     provider: GPUProvider,
     instances: dict,
-    idle_since: dict,
-    last_running: dict,
+    snapshots: dict,
     heartbeat_monitor: HeartbeatMonitor,
     gateway: GatewayClient,
     shutdown_event: asyncio.Event,
     provision_lock: asyncio.Lock,
-    on_reprovision: callable,
-    on_state_delete: callable | None = None,
-    on_cost_deregister: callable | None = None,
+    on_reprovision: Callable[[], Awaitable[None]],
+    on_state_delete: Callable[[str], Awaitable[None]] | None = None,
+    on_cost_deregister: Callable[[str], None] | None = None,
     poll_interval_sec: int | None = None,
 ) -> None:
     """Background task that polls provider status to detect instance death.
@@ -117,8 +117,7 @@ async def instance_death_monitor(
 
                     sm.transition(InstanceState.FAILED, reason="instance_death")
                     instances.pop(sm.record.instance_id, None)
-                    idle_since.pop(sm.record.instance_id, None)
-                    last_running.pop(sm.record.instance_id, None)
+                    snapshots.pop(sm.record.instance_id, None)
 
                     if on_state_delete is not None:
                         result = on_state_delete(sm.record.instance_id)

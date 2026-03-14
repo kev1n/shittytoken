@@ -7,6 +7,7 @@ because the gateway runs as a single-process async application.
 
 from __future__ import annotations
 
+import collections
 import time
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,14 @@ _latency_count: int = 0
 _overhead_bucket_counts: list[int] = [0] * len(_LATENCY_BUCKETS)
 _overhead_sum: float = 0.0
 _overhead_count: int = 0
+
+# TTFT histogram (time to first token from upstream, excludes gateway overhead)
+_TTFT_BUCKETS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, float("inf"))
+_ttft_bucket_counts: list[int] = [0] * len(_TTFT_BUCKETS)
+_ttft_sum: float = 0.0
+_ttft_count: int = 0
+# Rolling window for p95 computation (last 200 observations)
+_ttft_window: collections.deque[float] = collections.deque(maxlen=200)
 
 # Per-worker request counters
 _worker_requests_total: dict[str, int] = {}  # url -> count
@@ -62,7 +71,7 @@ def inc_active() -> None:
 
 def dec_active() -> None:
     global _requests_active
-    _requests_active -= 1
+    _requests_active = max(0, _requests_active - 1)
 
 
 def add_tokens(prompt: int, completion: int, cached: int = 0) -> None:
@@ -80,6 +89,27 @@ def observe_latency(duration_sec: float) -> None:
         if duration_sec <= boundary:
             _latency_bucket_counts[i] += 1
             break
+
+
+def observe_ttft(duration_sec: float) -> None:
+    """Record time-to-first-token in the TTFT histogram and rolling window."""
+    global _ttft_sum, _ttft_count
+    _ttft_sum += duration_sec
+    _ttft_count += 1
+    for i, boundary in enumerate(_TTFT_BUCKETS):
+        if duration_sec <= boundary:
+            _ttft_bucket_counts[i] += 1
+            break
+    _ttft_window.append(duration_sec)
+
+
+def get_ttft_p95() -> float | None:
+    """Return the p95 TTFT from the rolling window, or None if no data."""
+    if not _ttft_window:
+        return None
+    sorted_vals = sorted(_ttft_window)
+    idx = int(len(sorted_vals) * 0.95)
+    return sorted_vals[min(idx, len(sorted_vals) - 1)]
 
 
 def observe_overhead(duration_sec: float) -> None:
@@ -185,6 +215,13 @@ async def handle_metrics(request: web.Request) -> web.Response:
         _LATENCY_BUCKETS, _overhead_bucket_counts, _overhead_sum, _overhead_count,
     ))
 
+    # -- shittytoken_ttft_seconds (histogram) --------------------------------
+    lines.extend(_histogram_lines(
+        "shittytoken_ttft_seconds",
+        "Time to first token from upstream (seconds, excludes gateway overhead).",
+        _TTFT_BUCKETS, _ttft_bucket_counts, _ttft_sum, _ttft_count,
+    ))
+
     # -- Per-worker metrics from pool --------------------------------------
     pool: WorkerPool | None = request.app.get("worker_pool")
     total_running = 0
@@ -242,6 +279,60 @@ async def handle_metrics(request: web.Request) -> web.Response:
         lines.append("# TYPE shittytoken_worker_requests_total counter")
         for url, count in sorted(_worker_requests_total.items()):
             lines.append(f'shittytoken_worker_requests_total{{url="{url}"}} {count}')
+
+        # -- vLLM engine metrics (scraped from workers, re-exposed as aggregates) --
+
+        # Aggregate token counters (for throughput via rate())
+        total_prompt_tokens = sum(w.prompt_tokens_total for w in workers)
+        total_gen_tokens = sum(w.generation_tokens_total for w in workers)
+        lines.append("# HELP shittytoken_vllm_prompt_tokens_total Total prompt tokens processed by vLLM.")
+        lines.append("# TYPE shittytoken_vllm_prompt_tokens_total counter")
+        lines.append(f"shittytoken_vllm_prompt_tokens_total {total_prompt_tokens}")
+        lines.append("# HELP shittytoken_vllm_generation_tokens_total Total generation tokens produced by vLLM.")
+        lines.append("# TYPE shittytoken_vllm_generation_tokens_total counter")
+        lines.append(f"shittytoken_vllm_generation_tokens_total {total_gen_tokens}")
+
+        # Aggregate preemptions (memory pressure indicator)
+        total_preemptions = sum(w.preemptions_total for w in workers)
+        lines.append("# HELP shittytoken_vllm_preemptions_total Total KV cache preemption events.")
+        lines.append("# TYPE shittytoken_vllm_preemptions_total counter")
+        lines.append(f"shittytoken_vllm_preemptions_total {total_preemptions}")
+
+        # Aggregate completed requests
+        total_success = sum(w.request_success_total for w in workers)
+        lines.append("# HELP shittytoken_vllm_request_success_total Total completed requests in vLLM.")
+        lines.append("# TYPE shittytoken_vllm_request_success_total counter")
+        lines.append(f"shittytoken_vllm_request_success_total {total_success}")
+
+        # Aggregate TTFT (from vLLM engine, more accurate than gateway measurement)
+        total_ttft_sum = sum(w.ttft_sum for w in workers)
+        total_ttft_count = sum(w.ttft_count for w in workers)
+        lines.append("# HELP shittytoken_vllm_ttft_seconds_sum Sum of vLLM engine TTFT across all workers.")
+        lines.append("# TYPE shittytoken_vllm_ttft_seconds_sum counter")
+        lines.append(f"shittytoken_vllm_ttft_seconds_sum {total_ttft_sum:.6f}")
+        lines.append("# HELP shittytoken_vllm_ttft_seconds_count Count of vLLM engine TTFT observations.")
+        lines.append("# TYPE shittytoken_vllm_ttft_seconds_count counter")
+        lines.append(f"shittytoken_vllm_ttft_seconds_count {total_ttft_count}")
+
+        # Aggregate ITL (inter-token latency — decode speed)
+        total_itl_sum = sum(w.itl_sum for w in workers)
+        total_itl_count = sum(w.itl_count for w in workers)
+        lines.append("# HELP shittytoken_vllm_itl_seconds_sum Sum of vLLM inter-token latency across all workers.")
+        lines.append("# TYPE shittytoken_vllm_itl_seconds_sum counter")
+        lines.append(f"shittytoken_vllm_itl_seconds_sum {total_itl_sum:.6f}")
+        lines.append("# HELP shittytoken_vllm_itl_seconds_count Count of vLLM ITL observations.")
+        lines.append("# TYPE shittytoken_vllm_itl_seconds_count counter")
+        lines.append(f"shittytoken_vllm_itl_seconds_count {total_itl_count}")
+
+        # Aggregate queue time
+        total_queue_sum = sum(w.queue_time_sum for w in workers)
+        total_queue_count = sum(w.queue_time_count for w in workers)
+        lines.append("# HELP shittytoken_vllm_queue_time_seconds_sum Sum of vLLM queue wait time.")
+        lines.append("# TYPE shittytoken_vllm_queue_time_seconds_sum counter")
+        lines.append(f"shittytoken_vllm_queue_time_seconds_sum {total_queue_sum:.6f}")
+        lines.append("# HELP shittytoken_vllm_queue_time_seconds_count Count of vLLM queue time observations.")
+        lines.append("# TYPE shittytoken_vllm_queue_time_seconds_count counter")
+        lines.append(f"shittytoken_vllm_queue_time_seconds_count {total_queue_count}")
     else:
         lines.append("# HELP num_requests_running Total requests running across workers.")
         lines.append("# TYPE num_requests_running gauge")

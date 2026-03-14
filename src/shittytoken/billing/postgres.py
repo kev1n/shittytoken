@@ -142,9 +142,11 @@ class BillingPostgres:
         self._pool = pool
 
     @classmethod
-    async def create(cls, dsn: str) -> BillingPostgres:
+    async def create(
+        cls, dsn: str, *, min_size: int = 2, max_size: int = 20
+    ) -> BillingPostgres:
         """Create pool and init schema."""
-        pool = await asyncpg.create_pool(dsn)
+        pool = await asyncpg.create_pool(dsn, min_size=min_size, max_size=max_size)
         instance = cls(pool)
         await instance._init_schema()
         logger.info("billing_postgres_ready", dsn=dsn)
@@ -272,6 +274,20 @@ class BillingPostgres:
                     row["id"],
                 )
                 return block
+
+    async def has_credit_block_for_payment(
+        self, stripe_payment_intent_id: str
+    ) -> bool:
+        """Check if a credit block already exists for a Stripe payment intent.
+
+        Queries ALL blocks (including exhausted/expired) for idempotency.
+        """
+        row = await self._pool.fetchrow(
+            "SELECT 1 FROM credit_blocks "
+            "WHERE stripe_payment_intent_id = $1 LIMIT 1",
+            stripe_payment_intent_id,
+        )
+        return row is not None
 
     async def get_active_blocks(self, user_id: str) -> list[CreditBlock]:
         rows = await self._pool.fetch(
@@ -429,15 +445,17 @@ class BillingPostgres:
         )
 
     async def batch_record_usage(self, events: list[UsageEvent]) -> None:
+        if not events:
+            return
         async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                for event in events:
-                    await conn.execute(
-                        "INSERT INTO usage_events "
-                        "(event_id, user_id, api_key_hash, model, prompt_tokens, "
-                        "completion_tokens, total_tokens, cost_cents, latency_ms, request_id) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
-                        "ON CONFLICT (event_id) DO NOTHING",
+            await conn.executemany(
+                "INSERT INTO usage_events "
+                "(event_id, user_id, api_key_hash, model, prompt_tokens, "
+                "completion_tokens, total_tokens, cost_cents, latency_ms, request_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+                "ON CONFLICT (event_id) DO NOTHING",
+                [
+                    (
                         event.event_id,
                         uuid.UUID(event.user_id),
                         event.api_key_hash,
@@ -449,3 +467,6 @@ class BillingPostgres:
                         event.latency_ms,
                         event.request_id,
                     )
+                    for event in events
+                ],
+            )

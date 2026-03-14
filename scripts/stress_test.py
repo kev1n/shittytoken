@@ -2,16 +2,14 @@
 """
 ShittyToken Stress Test — Agentic cache workload through the gateway.
 
-Based on entropy-script3.py pattern:
 - Fetches real text from Project Gutenberg as document corpus
 - Each user has a session with a FIXED document (cacheable prefix)
-- Multi-turn agentic pipeline: extract → analyze → cross-ref → synthesize → plan
-- Context grows each turn (history appended), prefix stays cached
-- 150:1 encode:decode ratio (realistic for long-context analysis)
-- Cache hit rate ≈ (avg_turns-1)/avg_turns per session
+- Multi-turn agentic pipeline with substantial output per turn
+- Target token ratio: 1 output : 5 cached input : 2 uncached input
+  (i.e. ~7:1 input:output, ~71% cache hit rate)
+- Designed to saturate GPU decode pipeline and trigger autoscaling
 
 Routes through the ShittyToken gateway with auth, billing, rate limiting.
-Uses Prometheus /metrics for cache hit rate (prompt_tokens_details is broken in vLLM V1).
 
 Usage:
     uv run python scripts/stress_test.py [OPTIONS]
@@ -48,33 +46,43 @@ BOOK_URLS = [
     "https://www.gutenberg.org/files/2701/2701-0.txt",   # Moby Dick
 ]
 
-# Agentic task pipeline — cycles through these
+# Agentic task pipeline — designed to produce substantial output
 AGENT_TASKS = [
     (
         "Extract",
-        "List the 3 most important named entities (people, places, or organizations) "
-        "from the NEW section of the document added this round. "
-        "Output only the names, one per line, nothing else."
+        "Perform a detailed entity extraction on the document. For each named entity "
+        "(people, places, organizations, dates, events), provide: the entity name, "
+        "its type, every passage where it appears (quote the surrounding sentence), "
+        "and a significance score from 1-10 with justification. Be thorough and exhaustive."
     ),
     (
         "Analyze",
-        "Using the entities just extracted, identify which one plays the most pivotal "
-        "role in this section and explain why in exactly one sentence."
+        "Write a detailed literary analysis of this section. Cover: narrative structure, "
+        "character motivations and development, thematic elements, symbolic imagery, "
+        "foreshadowing, tone shifts, and how this section advances the overall plot. "
+        "Support every claim with direct quotes from the text. Write at least 5 paragraphs."
     ),
     (
         "CrossRef",
-        "Find one direct quote from the document that best illustrates the main "
-        "conflict or tension in this section. Quote it exactly, under 20 words."
+        "Cross-reference this section against all previous sections analyzed so far. "
+        "Identify: recurring motifs (with quotes), character arc progressions, "
+        "contradictions or inconsistencies, parallel structures, and evolving themes. "
+        "Create a detailed comparison table in markdown format. Be comprehensive."
     ),
     (
         "Synthesize",
-        "In exactly two sentences: summarize what occurred in this section and how "
-        "it connects to the key entity identified above."
+        "Write a comprehensive synthesis report covering everything analyzed so far. "
+        "Include: an executive summary, detailed findings organized by theme, "
+        "character relationship mapping, timeline of events, unresolved questions, "
+        "and predictions for how the narrative will develop. Use structured headings."
     ),
     (
         "Plan",
-        "Given everything analyzed so far, state in one sentence the single most "
-        "important question an investigator should pursue next."
+        "Develop a detailed investigation plan based on all analysis so far. "
+        "For each open question identified, propose: specific hypotheses to test, "
+        "evidence needed, methodology for investigation, expected outcomes, "
+        "and how findings would change the overall interpretation. "
+        "Prioritize by importance and provide a recommended sequence of investigation steps."
     ),
 ]
 
@@ -274,13 +282,16 @@ def run():
     parser.add_argument("--gateway-url", default="http://localhost:8001")
     parser.add_argument("--users", type=int, default=10)
     parser.add_argument("--duration", type=int, default=300, help="Run duration in seconds")
-    parser.add_argument("--doc-tokens-min", type=int, default=500)
-    parser.add_argument("--doc-tokens-max", type=int, default=95000)
-    parser.add_argument("--session-min-turns", type=int, default=3)
-    parser.add_argument("--session-max-turns", type=int, default=12)
-    parser.add_argument("--session-max-tokens", type=int, default=100000)
-    parser.add_argument("--encode-decode-ratio", type=int, default=150)
-    parser.add_argument("--start-jitter", type=int, default=15)
+    parser.add_argument("--doc-tokens-min", type=int, default=2000)
+    parser.add_argument("--doc-tokens-max", type=int, default=60000)
+    parser.add_argument("--session-min-turns", type=int, default=4)
+    parser.add_argument("--session-max-turns", type=int, default=10)
+    parser.add_argument("--session-max-tokens", type=int, default=120000)
+    parser.add_argument("--input-output-ratio", type=int, default=7,
+                        help="Target input:output ratio (default 7 = 1 out : 5 cached : 2 uncached)")
+    parser.add_argument("--start-jitter", type=int, default=5)
+    parser.add_argument("--ramp-users", type=int, default=0,
+                        help="Ramp up users over this many seconds (0 = all at once)")
     args = parser.parse_args()
 
     GATEWAY_URL = args.gateway_url
@@ -291,8 +302,9 @@ def run():
     SESSION_MIN_TURNS = args.session_min_turns
     SESSION_MAX_TURNS = args.session_max_turns
     SESSION_MAX_TOKENS = args.session_max_tokens
-    ENCODE_DECODE_RATIO = args.encode_decode_ratio
+    INPUT_OUTPUT_RATIO = args.input_output_ratio
     START_JITTER_S = args.start_jitter
+    RAMP_USERS_S = args.ramp_users
 
     print("=" * 80)
     print("SHITTYTOKEN AGENTIC CACHE WORKLOAD TEST")
@@ -301,8 +313,10 @@ def run():
     print(f"  Duration:          {RUN_DURATION_S}s")
     print(f"  Doc size/session:  {DOC_TOKENS_MIN:,}–{DOC_TOKENS_MAX:,} tokens")
     print(f"  Session turns:     {SESSION_MIN_TURNS}–{SESSION_MAX_TURNS}")
-    print(f"  Encode:decode:     {ENCODE_DECODE_RATIO}:1")
+    print(f"  Input:output:      {INPUT_OUTPUT_RATIO}:1  (target: 1 out : 5 cached : 2 uncached)")
     print(f"  Start jitter:      0–{START_JITTER_S}s")
+    if RAMP_USERS_S:
+        print(f"  User ramp:         {RAMP_USERS_S}s (add users gradually)")
     print("=" * 80 + "\n")
 
     # Provision users
@@ -344,6 +358,11 @@ def run():
     def user_workflow(user_idx: int):
         nonlocal stop_reason
         user = users[user_idx]
+
+        # Ramp: stagger user start times to build pressure gradually
+        if RAMP_USERS_S > 0:
+            ramp_delay = (user_idx / max(1, USERS - 1)) * RAMP_USERS_S
+            time.sleep(ramp_delay)
         time.sleep(random.uniform(0, START_JITTER_S))
 
         session_num = 0
@@ -365,7 +384,10 @@ def run():
                     break
 
                 approx_prompt = (len(system_prompt) + sum(len(m["content"]) for m in history)) // 4
-                max_gen = max(1, approx_prompt // ENCODE_DECODE_RATIO)
+                # Target: 1 output : 5 cached : 2 uncached = 7 input : 1 output
+                max_gen = max(64, approx_prompt // INPUT_OUTPUT_RATIO)
+                # Cap at 4096 to keep requests finishing in reasonable time
+                max_gen = min(max_gen, 4096)
 
                 task_label, task_prompt = AGENT_TASKS[task_idx % len(AGENT_TASKS)]
                 task_idx += 1
@@ -378,16 +400,16 @@ def run():
                 try:
                     resp = chat_completion(GATEWAY_URL, user.api_key, msgs, max_tokens=max_gen)
                 except Exception as e:
-                    stop_event.set()
                     with results_lock:
-                        if stop_reason == "Time limit reached":
-                            stop_reason = f"Request error (user {user_idx}): {e}"
-                    return
+                        print(f"  [user {user_idx}] Error: {str(e)[:100]}")
+                    # Don't kill the whole test for one user's error
+                    time.sleep(2)
+                    continue
 
                 if "error" in resp:
-                    # Non-fatal: log and continue (might be rate limit, etc.)
                     with results_lock:
                         print(f"  [user {user_idx}] Error: {str(resp['error'])[:100]}")
+                    time.sleep(1)
                     continue
 
                 usage = resp.get("usage") or {}
@@ -465,7 +487,7 @@ def run():
     print(f"    Cached (KV hit):           {total_cached:>12,}  ({hit_rate*100:.1f}%)")
     print(f"    Uncached (prefilled):      {total_uncached:>12,}  ({(1-hit_rate)*100:.1f}%)")
     print(f"  Completion tokens:           {total_completion:>12,}")
-    print(f"  Avg encode:decode ratio:     {actual_ratio:>11.0f}:1  (target: {args.encode_decode_ratio}:1)")
+    print(f"  Avg input:output ratio:      {actual_ratio:>11.0f}:1  (target: {INPUT_OUTPUT_RATIO}:1)")
     print(f"  Avg prompt tokens/req:       {avg_prompt:>11,.0f}")
     print(f"  Avg completion tokens/req:   {avg_completion:>11,.0f}")
     print(f"\n  ── Latency ──")
@@ -487,7 +509,7 @@ def run():
             "doc_tokens_min": DOC_TOKENS_MIN, "doc_tokens_max": DOC_TOKENS_MAX,
             "session_min_turns": SESSION_MIN_TURNS, "session_max_turns": SESSION_MAX_TURNS,
             "session_max_tokens": SESSION_MAX_TOKENS,
-            "encode_decode_ratio": ENCODE_DECODE_RATIO,
+            "input_output_ratio": INPUT_OUTPUT_RATIO,
             "run_duration_s": RUN_DURATION_S,
         },
         "stop_reason": stop_reason,
@@ -499,7 +521,7 @@ def run():
             "total_completion_tokens": total_completion,
             "wall_ms": wall_ms,
             "cache_hit_rate": hit_rate,
-            "actual_encode_decode_ratio": actual_ratio,
+            "actual_input_output_ratio": actual_ratio,
             "cost_cents": total_cost,
         },
         "requests": [

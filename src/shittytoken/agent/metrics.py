@@ -2,10 +2,9 @@
 Metrics scraper — collects and aggregates vLLM Prometheus metrics across
 all active workers.
 
-Only three metrics are extracted from each worker:
-  - num_requests_running
-  - num_requests_waiting
-  - gpu_cache_usage_perc
+Extracts gauges (running/waiting/cache), histogram _sum/_count pairs
+(TTFT, ITL, queue time), and counters (tokens, preemptions) from each
+worker's /metrics endpoint.
 
 Workers that fail to respond contribute 0 to totals (not failure).
 """
@@ -24,11 +23,37 @@ logger = structlog.get_logger()
 
 
 @dataclass
+class WorkerMetrics:
+    """Per-worker metrics scraped from vLLM /metrics."""
+    url: str
+    requests_running: int = 0
+    requests_waiting: int = 0
+    kv_cache_pct: float = 0.0
+    prefix_cache_hits: float = 0.0
+    prefix_cache_queries: float = 0.0
+    reachable: bool = True  # False if scrape failed
+
+    # vLLM histogram _sum/_count (for delta-based averages)
+    ttft_sum: float = 0.0
+    ttft_count: float = 0.0
+    itl_sum: float = 0.0
+    itl_count: float = 0.0
+    queue_time_sum: float = 0.0
+    queue_time_count: float = 0.0
+
+    # vLLM counters (monotonic, use deltas for rates)
+    prompt_tokens_total: float = 0.0
+    generation_tokens_total: float = 0.0
+    preemptions_total: float = 0.0
+
+
+@dataclass
 class AggregateMetrics:
     total_requests_running: int
     total_requests_waiting: int
     avg_kv_cache_usage: float   # average across all workers (0.0–1.0)
     worker_count: int
+    per_worker: list[WorkerMetrics] | None = None  # populated when available
 
 
 
@@ -91,12 +116,38 @@ async def aggregate_metrics(
     total_running = 0
     total_waiting = 0
     kv_cache_values: list[float] = []
+    per_worker: list[WorkerMetrics] = []
 
-    for metrics in raw_results:
-        total_running += int(metrics.get("vllm:num_requests_running", metrics.get("num_requests_running", 0)))
-        total_waiting += int(metrics.get("vllm:num_requests_waiting", metrics.get("num_requests_waiting", 0)))
-        if "vllm:gpu_cache_usage_perc" in metrics or "gpu_cache_usage_perc" in metrics:
-            kv_cache_values.append(metrics.get("vllm:gpu_cache_usage_perc", metrics.get("gpu_cache_usage_perc", 0.0)))
+    for url, metrics in zip(worker_urls, raw_results):
+        reachable = len(metrics) > 0  # empty dict = scrape failed
+        running = int(metrics.get("vllm:num_requests_running", metrics.get("num_requests_running", 0)))
+        waiting = int(metrics.get("vllm:num_requests_waiting", metrics.get("num_requests_waiting", 0)))
+        total_running += running
+        total_waiting += waiting
+        kv_pct = 0.0
+        for kv_key in ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc", "gpu_cache_usage_perc"):
+            if kv_key in metrics:
+                kv_pct = metrics[kv_key]
+                kv_cache_values.append(kv_pct)
+                break
+        per_worker.append(WorkerMetrics(
+            url=url,
+            requests_running=running,
+            requests_waiting=waiting,
+            kv_cache_pct=kv_pct,
+            prefix_cache_hits=metrics.get("vllm:prefix_cache_hits_total", 0.0),
+            prefix_cache_queries=metrics.get("vllm:prefix_cache_queries_total", 0.0),
+            reachable=reachable,
+            ttft_sum=metrics.get("vllm:time_to_first_token_seconds_sum", 0.0),
+            ttft_count=metrics.get("vllm:time_to_first_token_seconds_count", 0.0),
+            itl_sum=metrics.get("vllm:inter_token_latency_seconds_sum", 0.0),
+            itl_count=metrics.get("vllm:inter_token_latency_seconds_count", 0.0),
+            queue_time_sum=metrics.get("vllm:request_queue_time_seconds_sum", 0.0),
+            queue_time_count=metrics.get("vllm:request_queue_time_seconds_count", 0.0),
+            prompt_tokens_total=metrics.get("vllm:prompt_tokens_total", 0.0),
+            generation_tokens_total=metrics.get("vllm:generation_tokens_total", 0.0),
+            preemptions_total=metrics.get("vllm:num_preemptions_total", 0.0),
+        ))
 
     avg_kv = sum(kv_cache_values) / len(kv_cache_values) if kv_cache_values else 0.0
 
@@ -105,4 +156,5 @@ async def aggregate_metrics(
         total_requests_waiting=total_waiting,
         avg_kv_cache_usage=avg_kv,
         worker_count=len(worker_urls),
+        per_worker=per_worker,
     )

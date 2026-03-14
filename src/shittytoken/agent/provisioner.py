@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import abc
 import asyncio
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 import aiohttp
 import structlog
@@ -33,6 +34,41 @@ from ..config import cfg
 from ..knowledge.schema import Configuration
 
 logger = structlog.get_logger()
+
+_T = TypeVar("_T")
+
+
+async def _retry_async(
+    fn: Callable[[], Coroutine[Any, Any, _T]],
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 2.0,
+    label: str = "retry",
+) -> _T:
+    """Retry an async callable with exponential backoff.
+
+    Retries on any Exception except ValueError and RuntimeError (which
+    indicate a logic error, not a transient failure).
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await fn()
+        except (ValueError, RuntimeError):
+            raise  # not transient
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    f"{label}_retry",
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    delay_s=delay,
+                    error=str(exc),
+                )
+                await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -97,14 +133,6 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
 
     if config.enforce_eager:
         parts.append("--enforce-eager")
-
-    # LMCache KV connector — offloads evicted KV cache to CPU RAM
-    _lmcache = _vllm.get("lmcache", {})
-    if _lmcache.get("enabled", False):
-        import json as _json
-
-        kv_config = {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both"}
-        parts += ["--kv-transfer-config", _json.dumps(kv_config)]
 
     # Extra CLI args from config
     extra_args = _vllm.get("extra_args", [])
@@ -274,23 +302,6 @@ class DeploymentPlan:
             f"    enforce_eager:          {self.enforce_eager}",
         ]
 
-        # LMCache info
-        _lmcache = cfg.get("vllm", {}).get("lmcache", {})
-        if _lmcache.get("enabled", False):
-            lines.append("")
-            lines.append("  LMCache (CPU KV offload):")
-            lines.append(f"    chunk_size:             {_lmcache.get('chunk_size', 256)}")
-            max_cpu = _lmcache.get("max_cpu_size_gb", "auto")
-            if max_cpu == "auto":
-                cpu_ram = o.raw.get("cpu_ram")
-                reserve = _lmcache.get("cpu_reserve_gb", 8.0)
-                if cpu_ram and cpu_ram > reserve:
-                    lines.append(f"    cpu_cache_size:         {round(cpu_ram - reserve, 1)} GB (auto: {cpu_ram} GB RAM - {reserve} GB reserve)")
-                else:
-                    lines.append(f"    cpu_cache_size:         auto (machine RAM unknown)")
-            else:
-                lines.append(f"    cpu_cache_size:         {max_cpu} GB")
-
         lines += [
             "",
             "  Command:",
@@ -401,9 +412,12 @@ class VastAIProvider(GPUProvider):
             min_gpus=min_gpus,
         )
 
-        # SDK is synchronous — run in thread pool
-        raw_offers = await asyncio.to_thread(
-            self._client.search_offers, query=query_str, type="on-demand"
+        # SDK is synchronous — run in thread pool (with retry for transient API errors)
+        raw_offers = await _retry_async(
+            lambda: asyncio.to_thread(
+                self._client.search_offers, query=query_str, type="on-demand"
+            ),
+            label="vastai_search_offers",
         )
 
         if not isinstance(raw_offers, list):
@@ -457,41 +471,12 @@ class VastAIProvider(GPUProvider):
                 f"-e HF_HOME={mount_path}/huggingface",
                 f"-e VLLM_CACHE_ROOT={mount_path}/vllm",
                 f"-e TRITON_CACHE_DIR={mount_path}/triton",
+                f"-e FLASHINFER_CACHE_DIR={mount_path}/flashinfer",
+                f"-e TORCH_EXTENSIONS_DIR={mount_path}/torch_extensions",
+                f"-e PIP_CACHE_DIR={mount_path}/pip",
             ]
         for k, v in _vllm_cfg.get("env", {}).items():
             env_parts.append(f"-e {k}={v}")
-
-        # LMCache env vars — CPU RAM KV cache offloading
-        _lmcache = _vllm_cfg.get("lmcache", {})
-        if _lmcache.get("enabled", False):
-            chunk_size = _lmcache.get("chunk_size", 256)
-            env_parts += [
-                f"-e LMCACHE_CHUNK_SIZE={chunk_size}",
-                "-e LMCACHE_LOCAL_CPU=True",
-            ]
-            max_cpu = _lmcache.get("max_cpu_size_gb", "auto")
-            if max_cpu != "auto":
-                env_parts.append(f"-e LMCACHE_MAX_LOCAL_CPU_SIZE={max_cpu}")
-            else:
-                # Auto-detect: use machine's CPU RAM minus reserve
-                cpu_ram_gb = offer.raw.get("cpu_ram", 0)
-                reserve_gb = _lmcache.get("cpu_reserve_gb", 8.0)
-                if cpu_ram_gb > reserve_gb:
-                    auto_size = round(cpu_ram_gb - reserve_gb, 1)
-                    env_parts.append(f"-e LMCACHE_MAX_LOCAL_CPU_SIZE={auto_size}")
-                    logger.info(
-                        "lmcache_cpu_auto_sized",
-                        machine_cpu_ram_gb=cpu_ram_gb,
-                        reserve_gb=reserve_gb,
-                        lmcache_cpu_size_gb=auto_size,
-                    )
-                else:
-                    logger.warning(
-                        "lmcache_cpu_ram_too_low",
-                        machine_cpu_ram_gb=cpu_ram_gb,
-                        reserve_gb=reserve_gb,
-                        msg="Falling back to LMCache default CPU size",
-                    )
 
         env_str = " ".join(env_parts)
 
@@ -897,6 +882,38 @@ class RunPodProvider(GPUProvider):
         """Run a GraphQL query in a thread (the SDK is synchronous)."""
         return await asyncio.to_thread(self._graphql_query, query)
 
+    # -- REST helpers (network volumes) --------------------------------------
+
+    def _rest_request(
+        self,
+        method: str,
+        path: str,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict | list | None:
+        """Execute a REST API request against https://rest.runpod.io/v1."""
+        import requests
+
+        url = f"https://rest.runpod.io/v1{path}"
+        resp = requests.request(
+            method,
+            url,
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            json=json_body,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        if resp.status_code == 204:
+            return None
+        return resp.json()
+
+    async def _async_rest(
+        self,
+        method: str,
+        path: str,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict | list | None:
+        return await asyncio.to_thread(self._rest_request, method, path, json_body)
+
     # -- GPUProvider interface -----------------------------------------------
 
     async def find_offers(
@@ -909,7 +926,10 @@ class RunPodProvider(GPUProvider):
         runpod_cfg = cfg.get("orchestrator", {}).get("runpod", {})
         cloud_type = runpod_cfg.get("cloud_type", "COMMUNITY")
 
-        all_gpus = await asyncio.to_thread(self._runpod.get_gpus)
+        all_gpus = await _retry_async(
+            lambda: asyncio.to_thread(self._runpod.get_gpus),
+            label="runpod_get_gpus",
+        )
 
         gpu_names_lower = {n.lower() for n in gpu_names}
         offers: list[GPUOffer] = []
@@ -983,6 +1003,19 @@ class RunPodProvider(GPUProvider):
         # after "vllm serve" to avoid doubling the command.
         docker_args = vllm_command.removeprefix("vllm serve ")
 
+        # Resolve network volume (Secure Cloud only)
+        network_volume_id = await self.ensure_network_volume()
+
+        # Build volume-related GraphQL fields and cache env vars
+        if network_volume_id:
+            nv_cfg = cfg.get("orchestrator", {}).get("runpod", {}).get("network_volume", {})
+            mount_path = nv_cfg.get("mount_path", "/workspace")
+            volume_field = f'networkVolumeId: "{network_volume_id}"'
+            cache_env = self._build_cache_env_entries(mount_path)
+        else:
+            volume_field = "volumeInGb: 0"
+            cache_env = ""
+
         # GraphQL env expects [{key, value}] objects, not a JSON string.
         mutation = f"""
         mutation {{
@@ -994,13 +1027,13 @@ class RunPodProvider(GPUProvider):
             name: "shittytoken-worker"
             imageName: "{docker_image}"
             containerDiskInGb: {disk_gb}
-            volumeInGb: 0
+            {volume_field}
             ports: "8080/http,22/tcp"
             startSsh: true
             supportPublicIp: true
             dockerArgs: "{docker_args}"
             env: [
-              {{key: "HF_TOKEN", value: "{hf_token}"}}{self._build_env_entries(_vllm_cfg)}
+              {{key: "HF_TOKEN", value: "{hf_token}"}}{cache_env}{self._build_env_entries(_vllm_cfg)}
             ]
           }}) {{
             id
@@ -1016,6 +1049,7 @@ class RunPodProvider(GPUProvider):
             gpu_count=offer.num_gpus,
             spot_price=round(spot_price, 4),
             cloud_type=cloud_type,
+            network_volume_id=network_volume_id,
         )
 
         result = await self._async_graphql(mutation)
@@ -1130,7 +1164,7 @@ class RunPodProvider(GPUProvider):
         query {
           myself {
             pods {
-              id desiredStatus gpuCount costPerHr
+              id desiredStatus gpuCount costPerHr networkVolumeId
               machine { gpuDisplayName }
             }
           }
@@ -1144,7 +1178,142 @@ class RunPodProvider(GPUProvider):
             logger.warning("runpod_list_pods_failed", error=str(exc))
             return []
 
+    # -- Network volume management -------------------------------------------
+
+    async def list_network_volumes(self) -> list[dict]:
+        """List all network volumes on this RunPod account."""
+        result = await self._async_rest("GET", "/networkvolumes")
+        return result if isinstance(result, list) else []
+
+    async def create_network_volume(
+        self, name: str, size_gb: int, datacenter_id: str
+    ) -> dict:
+        """Create a network volume via RunPod REST API."""
+        result = await self._async_rest("POST", "/networkvolumes", {
+            "name": name,
+            "size": size_gb,
+            "dataCenterId": datacenter_id,
+        })
+        if not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError(f"RunPod create network volume failed: {result}")
+        logger.info(
+            "runpod_network_volume_created",
+            volume_id=result["id"],
+            name=name,
+            size_gb=size_gb,
+            datacenter_id=datacenter_id,
+        )
+        return result
+
+    async def delete_network_volume(self, volume_id: str) -> None:
+        """Delete a network volume by ID."""
+        await self._async_rest("DELETE", f"/networkvolumes/{volume_id}")
+        logger.info("runpod_network_volume_deleted", volume_id=volume_id)
+
+    async def find_network_volume(self) -> dict | None:
+        """Find an existing shittytoken network volume in the configured datacenter."""
+        nv_cfg = cfg.get("orchestrator", {}).get("runpod", {}).get("network_volume", {})
+        prefix = nv_cfg.get("name_prefix", "shittytoken")
+        datacenter_id = nv_cfg.get("datacenter_id", "")
+
+        volumes = await self.list_network_volumes()
+        for vol in volumes:
+            if (
+                vol.get("dataCenterId") == datacenter_id
+                and vol.get("name", "").startswith(prefix)
+            ):
+                return vol
+        return None
+
+    async def ensure_network_volume(self) -> str | None:
+        """Return the network volume ID, creating one if needed.
+
+        Returns None if network volumes are disabled or cloud_type is not SECURE.
+        """
+        nv_cfg = cfg.get("orchestrator", {}).get("runpod", {}).get("network_volume", {})
+        if not nv_cfg.get("enabled", False):
+            return None
+
+        runpod_cfg = cfg.get("orchestrator", {}).get("runpod", {})
+        cloud_type = runpod_cfg.get("cloud_type", "COMMUNITY")
+        if cloud_type != "SECURE":
+            logger.info(
+                "runpod_network_volume_skipped",
+                reason="network volumes require cloud_type SECURE",
+                cloud_type=cloud_type,
+            )
+            return None
+
+        existing = await self.find_network_volume()
+        if existing:
+            logger.info(
+                "runpod_network_volume_reusing",
+                volume_id=existing["id"],
+                name=existing.get("name"),
+                size_gb=existing.get("size"),
+            )
+            return existing["id"]
+
+        datacenter_id = nv_cfg.get("datacenter_id", "EU-RO-1")
+        size_gb = nv_cfg.get("size_gb", 50)
+        prefix = nv_cfg.get("name_prefix", "shittytoken")
+        name = f"{prefix}-{datacenter_id}"
+
+        vol = await self.create_network_volume(name, size_gb, datacenter_id)
+        return vol["id"]
+
+    async def evict_stale_volumes(self, max_age_days: float) -> int:
+        """Delete shittytoken network volumes with no attached pods.
+
+        Network volumes don't track last-used timestamps, so this only
+        deletes volumes that have no pods currently attached. The
+        orchestrator calls this periodically for cleanup.
+        """
+        nv_cfg = cfg.get("orchestrator", {}).get("runpod", {}).get("network_volume", {})
+        prefix = nv_cfg.get("name_prefix", "shittytoken")
+
+        volumes = await self.list_network_volumes()
+        # Query pods to find which network volumes are in use
+        pods = await self.list_all_instances()
+        in_use_vol_ids: set[str] = set()
+        for pod in pods:
+            nv_id = pod.get("networkVolumeId")
+            if nv_id:
+                in_use_vol_ids.add(nv_id)
+
+        evicted = 0
+        for vol in volumes:
+            name = vol.get("name", "")
+            if not name.startswith(prefix):
+                continue
+            if vol["id"] in in_use_vol_ids:
+                continue
+            logger.info(
+                "runpod_network_volume_evicting",
+                volume_id=vol["id"],
+                name=name,
+            )
+            await self.delete_network_volume(vol["id"])
+            evicted += 1
+
+        if evicted:
+            logger.info("runpod_network_volumes_evicted", count=evicted)
+        return evicted
+
     # -- Helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _build_cache_env_entries(mount_path: str) -> str:
+        """Build GraphQL env entries to redirect caches to the network volume."""
+        dirs = {
+            "HF_HOME": f"{mount_path}/huggingface",
+            "VLLM_CACHE_ROOT": f"{mount_path}/vllm",
+            "TRITON_CACHE_DIR": f"{mount_path}/triton",
+            "FLASHINFER_CACHE_DIR": f"{mount_path}/flashinfer",
+            "TORCH_EXTENSIONS_DIR": f"{mount_path}/torch_extensions",
+            "PIP_CACHE_DIR": f"{mount_path}/pip",
+        }
+        return "".join(f', {{key: "{k}", value: "{v}"}}' for k, v in dirs.items())
 
     @staticmethod
     def _build_env_entries(vllm_cfg: dict) -> str:

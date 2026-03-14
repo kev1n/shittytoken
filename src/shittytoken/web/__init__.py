@@ -16,7 +16,7 @@ from .app import create_web_app
 
 
 async def _run() -> None:
-    configure_logging()
+    configure_logging(component="web")
     logger = structlog.get_logger()
 
     billing_cfg = cfg["gateway"]["billing"]

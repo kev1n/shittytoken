@@ -27,13 +27,30 @@ _UNHEALTHY_THRESHOLD = 3
 @dataclass
 class WorkerState:
     url: str
-    requests_running: int = 0
-    requests_waiting: int = 0
+    requests_running: int = 0     # from vLLM /metrics scrape
+    requests_waiting: int = 0     # from vLLM /metrics scrape
+    local_in_flight: int = 0      # tracked by proxy (inc on send, dec on response)
     kv_cache_pct: float = 0.0
     prefix_cache_hits: float = 0.0
     prefix_cache_queries: float = 0.0
     healthy: bool = True
     added_at: float = field(default_factory=time.monotonic)
+
+    # vLLM histogram _sum/_count pairs (for computing averages)
+    ttft_sum: float = 0.0
+    ttft_count: float = 0.0
+    itl_sum: float = 0.0
+    itl_count: float = 0.0
+    e2e_latency_sum: float = 0.0
+    e2e_latency_count: float = 0.0
+    queue_time_sum: float = 0.0
+    queue_time_count: float = 0.0
+
+    # vLLM counters (monotonic)
+    prompt_tokens_total: float = 0.0
+    generation_tokens_total: float = 0.0
+    preemptions_total: float = 0.0
+    request_success_total: float = 0.0
 
 
 class WorkerPool:
@@ -149,7 +166,11 @@ class WorkerPool:
         parsed = parse_prometheus_text(text)
         requests_running = int(parsed.get("vllm:num_requests_running", parsed.get("num_requests_running", 0)))
         requests_waiting = int(parsed.get("vllm:num_requests_waiting", parsed.get("num_requests_waiting", 0)))
-        kv_cache_pct = parsed.get("vllm:kv_cache_usage_perc", parsed.get("kv_cache_usage_perc", 0.0))
+        kv_cache_pct = parsed.get(
+            "vllm:kv_cache_usage_perc",                          # vLLM v1
+            parsed.get("vllm:gpu_cache_usage_perc",              # vLLM v0
+                        parsed.get("gpu_cache_usage_perc", 0.0)),
+        )
         cache_hits = parsed.get("vllm:prefix_cache_hits_total", 0.0)
         cache_queries = parsed.get("vllm:prefix_cache_queries_total", 0.0)
 
@@ -158,6 +179,22 @@ class WorkerPool:
         if worker is not None:
             worker.prefix_cache_hits = cache_hits
             worker.prefix_cache_queries = cache_queries
+
+            # vLLM histogram _sum/_count (for computing averages)
+            worker.ttft_sum = parsed.get("vllm:time_to_first_token_seconds_sum", 0.0)
+            worker.ttft_count = parsed.get("vllm:time_to_first_token_seconds_count", 0.0)
+            worker.itl_sum = parsed.get("vllm:inter_token_latency_seconds_sum", 0.0)
+            worker.itl_count = parsed.get("vllm:inter_token_latency_seconds_count", 0.0)
+            worker.e2e_latency_sum = parsed.get("vllm:e2e_request_latency_seconds_sum", 0.0)
+            worker.e2e_latency_count = parsed.get("vllm:e2e_request_latency_seconds_count", 0.0)
+            worker.queue_time_sum = parsed.get("vllm:request_queue_time_seconds_sum", 0.0)
+            worker.queue_time_count = parsed.get("vllm:request_queue_time_seconds_count", 0.0)
+
+            # vLLM counters
+            worker.prompt_tokens_total = parsed.get("vllm:prompt_tokens_total", 0.0)
+            worker.generation_tokens_total = parsed.get("vllm:generation_tokens_total", 0.0)
+            worker.preemptions_total = parsed.get("vllm:num_preemptions_total", 0.0)
+            worker.request_success_total = parsed.get("vllm:request_success_total", 0.0)
 
         # Successful scrape — reset failure counter and mark healthy.
         self._consecutive_failures[url] = 0

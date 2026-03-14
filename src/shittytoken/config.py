@@ -43,8 +43,64 @@ def load_config(path: Path | str | None = None) -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
-# Singleton — loaded once at import time.
-cfg: dict[str, Any] = load_config()
+# Singleton — loaded lazily on first access.
+_cfg: dict[str, Any] | None = None
+
+
+def _get_cfg() -> dict[str, Any]:
+    global _cfg
+    if _cfg is None:
+        _cfg = load_config()
+    return _cfg
+
+
+class _CfgProxy(dict):
+    """Dict proxy that loads config lazily on first access.
+
+    This avoids triggering filesystem walks at import time, which
+    breaks tests and CI environments that don't have config.yml in
+    the expected location.
+    """
+
+    def _ensure_loaded(self) -> dict[str, Any]:
+        if not super().__len__():
+            super().update(_get_cfg())
+        return self
+
+    def __getitem__(self, key):
+        self._ensure_loaded()
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        self._ensure_loaded()
+        return super().__contains__(key)
+
+    def get(self, key, default=None):
+        self._ensure_loaded()
+        return super().get(key, default)
+
+    def __len__(self):
+        self._ensure_loaded()
+        return super().__len__()
+
+    def __iter__(self):
+        self._ensure_loaded()
+        return super().__iter__()
+
+    def items(self):
+        self._ensure_loaded()
+        return super().items()
+
+    def keys(self):
+        self._ensure_loaded()
+        return super().keys()
+
+    def values(self):
+        self._ensure_loaded()
+        return super().values()
+
+
+cfg: dict[str, Any] = _CfgProxy()
 
 
 # ── Helper accessors (avoid deep dict lookups everywhere) ───────────────────
@@ -112,8 +168,8 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
 
-    # Web session
-    web_session_secret: str = "change-me-in-production"
+    # Web session — MUST be set via WEB_SESSION_SECRET env var in production.
+    web_session_secret: str = ""
 
     # SSH
     ssh_private_key_path: str = "~/.ssh/id_ed25519"

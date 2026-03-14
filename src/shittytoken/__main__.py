@@ -17,7 +17,7 @@ async def seed() -> None:
     from .knowledge.seed import seed as run_seed
     from .log import configure_logging
 
-    configure_logging()
+    configure_logging(component="seed")
 
     settings = Settings()
     kg = KnowledgeGraph(

@@ -30,5 +30,10 @@ def parse_prometheus_text(text: str) -> dict[str, float]:
             continue
         if not math.isfinite(value):
             continue
-        result[name] = value
+        # Counters (_total suffix) with label variants need summing;
+        # gauges and histogram _sum/_count are single-valued so last-write is fine.
+        if name.endswith("_total") and name in result:
+            result[name] += value
+        else:
+            result[name] = value
     return result

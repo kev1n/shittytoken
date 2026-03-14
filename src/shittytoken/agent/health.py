@@ -164,6 +164,10 @@ class HeartbeatMonitor:
         """Signal the run loop to exit after the current sleep."""
         self._running = False
 
+    def get_consecutive_failures(self, url: str) -> int:
+        """Return the current consecutive failure count for *url*."""
+        return self._failure_counts.get(url, 0)
+
     async def _check_worker(self, url: str) -> None:
         health_url = url.rstrip("/") + "/health"
         try:

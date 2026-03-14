@@ -16,7 +16,7 @@ from .router_app import create_router_app
 
 
 async def _run() -> None:
-    configure_logging()
+    configure_logging(component="gateway")
     logger = structlog.get_logger()
 
     port = cfg["gateway"]["router"]["port"]  # 8001

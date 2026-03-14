@@ -32,10 +32,19 @@ logger = structlog.get_logger()
 
 _REQUEST_LOG: collections.deque[dict] = collections.deque(maxlen=200)
 
-# Pricing constants ($/token) — adjust if cached tokens are priced differently
-_PRICE_INPUT = 2.5 / 100 / 1_000_000   # $0.025 per 1M input tokens
-_PRICE_CACHED = 2.5 / 100 / 1_000_000  # same rate for now — change if discounted
-_PRICE_OUTPUT = 15.0 / 100 / 1_000_000  # $0.15 per 1M output tokens
+
+def _get_pricing() -> tuple[float, float, float]:
+    """Read pricing from config, returning (input_$/token, cached_$/token, output_$/token)."""
+    from shittytoken.config import cfg
+    pricing = cfg.get("gateway", {}).get("billing", {}).get("pricing", {})
+    default = pricing.get("default", {})
+    input_per_1m = default.get("input_per_1m", 2.5)    # cents per 1M
+    output_per_1m = default.get("output_per_1m", 15.0)  # cents per 1M
+    # Convert cents/1M to $/token
+    input_rate = input_per_1m / 100 / 1_000_000
+    cached_rate = input_rate  # same rate for now
+    output_rate = output_per_1m / 100 / 1_000_000
+    return input_rate, cached_rate, output_rate
 
 
 async def _log_request(
@@ -46,16 +55,26 @@ async def _log_request(
     completion_tokens: int,
     cached_tokens: int,
     status: int,
+    ttft_sec: float | None = None,
 ) -> None:
     """Append a completed request to the ring buffer."""
+    price_input, price_cached, price_output = _get_pricing()
     uncached = prompt_tokens - cached_tokens
-    cost = uncached * _PRICE_INPUT + cached_tokens * _PRICE_CACHED + completion_tokens * _PRICE_OUTPUT
+    cost = uncached * price_input + cached_tokens * price_cached + completion_tokens * price_output
+    # tokens/s: output tokens divided by decode time (total minus TTFT)
+    tps: float | None = None
+    if completion_tokens > 0 and duration_sec > 0:
+        decode_time = duration_sec - (ttft_sec or 0)
+        if decode_time > 0:
+            tps = round(completion_tokens / decode_time, 1)
     entry = {
         "ts": time.time(),
         "request_id": request_id,
         "worker": worker_url,
         "status": status,
         "duration_ms": round(duration_sec * 1000, 1),
+        "ttft_ms": round(ttft_sec * 1000, 1) if ttft_sec is not None else None,
+        "tokens_per_sec": tps,
         "uncached_tokens": uncached,
         "cached_tokens": cached_tokens,
         "output_tokens": completion_tokens,
@@ -158,7 +177,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     # ---- routing ---------------------------------------------------------
     prefix_key = request.headers.get("X-Session-ID")
     if prefix_key is None:
-        prefix_key = policy.compute_prefix_key(messages)
+        prefix_key = policy.compute_prefix_key(messages, key_hash=key_hash)
 
     worker = pool.select(prefix_key)
     if worker is None:
@@ -168,7 +187,12 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             {"error": {"message": "No healthy workers available"}},
             status=503,
         )
+    worker.local_in_flight += 1
+    _routed_worker = worker  # save ref for decrement (worker var may change on retry)
     prom_metrics.inc_worker_request(worker.url)
+
+    def _dec_in_flight():
+        _routed_worker.local_in_flight = max(0, _routed_worker.local_in_flight - 1)
 
     # ---- prepare upstream request ----------------------------------------
     upstream_body = dict(body)
@@ -204,18 +228,18 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                         timeout=_UPSTREAM_TIMEOUT,
                     )
                 except (aiohttp.ClientError, TimeoutError) as retry_exc:
-                    prom_metrics.dec_active()
+                    prom_metrics.dec_active(); _dec_in_flight()
                     logger.error("proxy.retry_failed", worker=retry_worker.url, error=str(retry_exc))
                     return _upstream_unavailable()
                 # Update worker reference for logging
                 worker = retry_worker
                 upstream_url = retry_url
             else:
-                prom_metrics.dec_active()
+                prom_metrics.dec_active(); _dec_in_flight()
                 logger.error("proxy.no_retry_worker")
                 return _upstream_unavailable()
         else:
-            prom_metrics.dec_active()
+            prom_metrics.dec_active(); _dec_in_flight()
             logger.error("proxy.upstream_connect_error_no_retry", worker=worker.url)
             return _upstream_unavailable()
 
@@ -228,7 +252,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             body=error_body[:500],
         )
         upstream_resp.release()
-        prom_metrics.dec_active()
+        prom_metrics.dec_active(); _dec_in_flight()
         return web.Response(
             text=error_body,
             status=upstream_resp.status,
@@ -239,7 +263,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     if not client_streaming:
         resp_body = await upstream_resp.text()
         upstream_resp.release()
-        prom_metrics.dec_active()
+        prom_metrics.dec_active(); _dec_in_flight()
         prom_metrics.inc_request("POST", 200)
         duration = time.monotonic() - request_start
         prom_metrics.observe_latency(duration)
@@ -276,7 +300,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         await response.prepare(request)
     except Exception:
         upstream_resp.release()
-        prom_metrics.dec_active()
+        prom_metrics.dec_active(); _dec_in_flight()
         raise
 
     last_data_line: str | None = None
@@ -284,18 +308,41 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     completion_tokens = 0
     cached_tokens = 0
     stream_error = False
+    # Buffer for incomplete lines split across TCP chunks
+    _line_buffer = ""
 
+    ttft_recorded = False
+    ttft: float | None = None
     try:
         async for raw_chunk in upstream_resp.content:
             # Write the raw bytes to client immediately (no buffering).
             await response.write(raw_chunk)
 
             # Parse lines from the chunk to track the last data payload.
-            text = raw_chunk.decode("utf-8", errors="replace")
-            for line in text.split("\n"):
+            # Prepend any incomplete line from the previous chunk.
+            text = _line_buffer + raw_chunk.decode("utf-8", errors="replace")
+            lines = text.split("\n")
+            # Last element is either "" (chunk ended on \n) or a partial line
+            _line_buffer = lines.pop()
+
+            for line in lines:
                 line = line.rstrip("\r")
                 if line.startswith("data: "):
                     data_str = line[len("data: "):]
+
+                    # TTFT: record on first SSE event with actual token content.
+                    # The role-announcement chunk (content:"") is not a real token.
+                    if not ttft_recorded and data_str not in ("[DONE]", ""):
+                        try:
+                            _chunk_obj = json.loads(data_str)
+                            _delta = (_chunk_obj.get("choices") or [{}])[0].get("delta", {})
+                            if _delta.get("content") or _delta.get("reasoning"):
+                                ttft = time.monotonic() - request_start - gateway_overhead
+                                prom_metrics.observe_ttft(ttft)
+                                ttft_recorded = True
+                        except (json.JSONDecodeError, IndexError, AttributeError):
+                            pass
+
                     if data_str == "[DONE]":
                         # Stream finished — parse usage from buffered last data line.
                         if last_data_line is not None:
@@ -324,13 +371,13 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         )
     finally:
         upstream_resp.release()
-        prom_metrics.dec_active()
+        prom_metrics.dec_active(); _dec_in_flight()
         if not stream_error:
             prom_metrics.inc_request("POST", 200)
         duration = time.monotonic() - request_start
         prom_metrics.observe_latency(duration)
         await _record_usage(prompt_tokens, completion_tokens, on_usage, cached_tokens=cached_tokens)
-        await _log_request(request_id, worker.url, duration, prompt_tokens, completion_tokens, cached_tokens, 200 if not stream_error else 500)
+        await _log_request(request_id, worker.url, duration, prompt_tokens, completion_tokens, cached_tokens, 200 if not stream_error else 500, ttft_sec=ttft)
 
     try:
         await response.write_eof()

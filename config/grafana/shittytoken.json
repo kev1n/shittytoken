@@ -395,10 +395,198 @@
       "title": "Gateway Overhead (auth + routing)",
       "type": "timeseries"
     },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "seconds",
+            "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "id": 40,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "histogram_quantile(0.50, rate(shittytoken_ttft_seconds_bucket[5m]))",
+          "legendFormat": "p50 gateway",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "histogram_quantile(0.95, rate(shittytoken_ttft_seconds_bucket[5m]))",
+          "legendFormat": "p95 gateway",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_ttft_seconds_sum[5m]) / rate(shittytoken_vllm_ttft_seconds_count[5m])",
+          "legendFormat": "avg vLLM engine",
+          "refId": "C"
+        }
+      ],
+      "title": "Time to First Token (TTFT)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "seconds",
+            "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "id": 41,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_itl_seconds_sum[5m]) / rate(shittytoken_vllm_itl_seconds_count[5m])",
+          "legendFormat": "avg ITL",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_queue_time_seconds_sum[5m]) / rate(shittytoken_vllm_queue_time_seconds_count[5m])",
+          "legendFormat": "avg queue wait",
+          "refId": "B"
+        }
+      ],
+      "title": "Inter-Token Latency & Queue Time",
+      "type": "timeseries"
+    },
 
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "id": 105,
+      "title": "vLLM Engine",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "tokens/s",
+            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 35 },
+      "id": 42,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_prompt_tokens_total[5m])",
+          "legendFormat": "prefill tok/s",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_generation_tokens_total[5m])",
+          "legendFormat": "decode tok/s",
+          "refId": "B"
+        }
+      ],
+      "title": "vLLM Throughput (tokens/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "",
+            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          },
+          "unit": "percentunit", "min": 0, "max": 1
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 35 },
+      "id": 43,
+      "options": {
+        "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_prefix_cache_hits_total[5m]) / rate(shittytoken_prefix_cache_queries_total[5m])",
+          "legendFormat": "cache hit rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Prefix Cache Hit Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "events/s",
+            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 35 },
+      "id": 44,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_preemptions_total[5m])",
+          "legendFormat": "preemptions/s",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_vllm_request_success_total[5m])",
+          "legendFormat": "completed req/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Preemptions & Completed Requests",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
       "id": 104,
       "title": "Request Log",
       "type": "row"
@@ -437,6 +625,32 @@
             ]
           },
           {
+            "matcher": { "id": "byName", "options": "ttft_ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "custom.width", "value": 90 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 2000 },
+                { "color": "red", "value": 10000 }
+              ]}},
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "tok/s" },
+            "properties": [
+              { "id": "decimals", "value": 1 },
+              { "id": "custom.width", "value": 70 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null },
+                { "color": "yellow", "value": 10 },
+                { "color": "green", "value": 30 }
+              ]}},
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } }
+            ]
+          },
+          {
             "matcher": { "id": "byName", "options": "request_id" },
             "properties": [
               { "id": "custom.width", "value": 120 }
@@ -461,7 +675,7 @@
           }
         ]
       },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 27 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 44 },
       "id": 35,
       "options": {
         "showHeader": true,
@@ -490,6 +704,8 @@
             { "selector": "request_id", "text": "request_id", "type": "string" },
             { "selector": "status", "text": "status", "type": "number" },
             { "selector": "duration_ms", "text": "duration_ms", "type": "number" },
+            { "selector": "ttft_ms", "text": "ttft_ms", "type": "number" },
+            { "selector": "tokens_per_sec", "text": "tok/s", "type": "number" },
             { "selector": "uncached_tokens", "text": "uncached_tokens", "type": "number" },
             { "selector": "cached_tokens", "text": "cached_tokens", "type": "number" },
             { "selector": "output_tokens", "text": "output_tokens", "type": "number" },
@@ -506,7 +722,7 @@
 
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
       "id": 102,
       "title": "Workers",
       "type": "row"
@@ -528,7 +744,7 @@
           ]
         }
       },
-      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 27 },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 57 },
       "id": 6,
       "options": {
         "colorMode": "background", "graphMode": "none",
@@ -560,7 +776,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 61 },
       "id": 12,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" },
@@ -590,7 +806,7 @@
           "unit": "none"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 61 },
       "id": 13,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -620,7 +836,7 @@
           "unit": "percentunit", "min": 0, "max": 1
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 69 },
       "id": 14,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -640,7 +856,7 @@
 
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 },
       "id": 103,
       "title": "Orchestrator",
       "type": "row"
@@ -659,7 +875,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 78 },
       "id": 15,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
@@ -707,7 +923,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 78 },
       "id": 16,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" },

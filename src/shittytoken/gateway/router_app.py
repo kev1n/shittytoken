@@ -41,7 +41,9 @@ async def create_router_app(
     app = web.Application(middlewares=middlewares)
 
     # ── Core routing state ────────────────────────────────────────────
-    policy = CacheAwarePolicy()
+    _router_cfg = _gateway_cfg.get("router", {})
+    epsilon = _router_cfg.get("bounded_load_epsilon", 0.25)
+    policy = CacheAwarePolicy(epsilon=epsilon)
     pool = WorkerPool(policy=policy)
     app["worker_pool"] = pool
     app["routing_policy"] = policy
