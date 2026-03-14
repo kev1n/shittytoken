@@ -120,6 +120,7 @@ async def provision_and_qualify(
         ssh_user=provisioned.ssh_user,
         http_port=provisioned.http_port,
         config_id=config.config_id,
+        cost_per_hour_usd=plan.offer.cost_per_hour_usd or 0.0,
     )
     sm = InstanceStateMachine(record)
 

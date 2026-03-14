@@ -144,67 +144,37 @@
       "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 5 }
-            ]
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "$/hr",
+            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
           },
           "unit": "currencyUSD", "decimals": 4
         }
       },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 1 },
       "id": 3,
       "options": {
-        "colorMode": "background", "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "auto"
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
           "expr": "shittytoken_hourly_burn_usd",
-          "legendFormat": "$/hr",
+          "legendFormat": "GPU burn",
           "refId": "A"
-        }
-      ],
-      "title": "Burn Rate ($/hr)",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 10 },
-              { "color": "red", "value": 50 }
-            ]
-          },
-          "unit": "currencyUSD", "decimals": 4
-        }
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 5 },
-      "id": 7,
-      "options": {
-        "colorMode": "background", "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "auto"
-      },
-      "targets": [
+        },
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
           "expr": "shittytoken_cumulative_cost_usd",
-          "legendFormat": "Total",
-          "refId": "A"
+          "legendFormat": "cumulative",
+          "refId": "B"
         }
       ],
-      "title": "Cumulative Cost",
-      "type": "stat"
+      "title": "GPU Cost ($/hr + cumulative)",
+      "type": "timeseries"
     },
 
     {
@@ -269,7 +239,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_prefix_cache_hits_total[5m]) / (rate(shittytoken_prefix_cache_queries_total[5m]) > 0)",
+          "expr": "rate(shittytoken_tokens_total{type=\"cached\"}[5m]) / (rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) > 0)",
           "legendFormat": "hit rate",
           "refId": "A"
         }
@@ -299,7 +269,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_prefix_cache_hits_total[5m]) / (rate(shittytoken_prefix_cache_queries_total[5m]) > 0)",
+          "expr": "rate(shittytoken_tokens_total{type=\"cached\"}[5m]) / (rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) > 0)",
           "legendFormat": "cache hit rate",
           "refId": "A"
         }
@@ -318,7 +288,7 @@
             "lineWidth": 2, "showPoints": "never", "spanNulls": false,
             "stacking": { "group": "A", "mode": "normal" }
           },
-          "unit": "currencyUSD", "decimals": 6
+          "unit": "currencyUSD", "decimals": 4
         }
       },
       "gridPos": { "h": 8, "w": 4, "x": 20, "y": 9 },
@@ -330,18 +300,18 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) / 1000000 * 2.5 / 100",
+          "expr": "rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) * 3600 / 1000000 * 2.5 / 100",
           "legendFormat": "input",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"completion\"}[5m]) / 1000000 * 15 / 100",
+          "expr": "rate(shittytoken_tokens_total{type=\"completion\"}[5m]) * 3600 / 1000000 * 15 / 100",
           "legendFormat": "output",
           "refId": "B"
         }
       ],
-      "title": "API Revenue Rate ($/min)",
+      "title": "API Revenue ($/hr)",
       "type": "timeseries"
     },
 
@@ -663,28 +633,35 @@
         "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": {
-            "axisBorderShow": false, "axisLabel": "$/hr",
+            "axisBorderShow": false, "axisLabel": "",
             "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
-            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" }
           },
-          "unit": "currencyUSD"
+          "unit": "currencyUSD", "decimals": 4
         }
       },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
       "id": 17,
       "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
           "expr": "shittytoken_hourly_burn_usd",
-          "legendFormat": "Burn Rate",
+          "legendFormat": "GPU cost ($/hr)",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) * 3600 / 1000000 * 2.5 / 100 + rate(shittytoken_tokens_total{type=\"completion\"}[5m]) * 3600 / 1000000 * 15 / 100",
+          "legendFormat": "API revenue ($/hr)",
+          "refId": "B"
         }
       ],
-      "title": "Hourly Burn Rate Over Time",
+      "title": "Cost vs Revenue ($/hr)",
       "type": "timeseries"
     },
     {
@@ -693,28 +670,41 @@
         "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": {
-            "axisBorderShow": false, "axisLabel": "$",
-            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
-            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+            "axisBorderShow": false, "axisLabel": "seconds",
+            "drawStyle": "points", "fillOpacity": 0,
+            "lineWidth": 0, "showPoints": "always", "pointSize": 4,
+            "spanNulls": false
           },
-          "unit": "currencyUSD"
+          "unit": "s"
         }
       },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
       "id": 18,
       "options": {
-        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "shittytoken_cumulative_cost_usd",
-          "legendFormat": "Cumulative Cost",
+          "expr": "histogram_quantile(0.50, rate(shittytoken_request_duration_seconds_bucket[1m]))",
+          "legendFormat": "p50 (1m)",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "histogram_quantile(0.99, rate(shittytoken_request_duration_seconds_bucket[1m]))",
+          "legendFormat": "p99 (1m)",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_request_duration_seconds_sum[1m]) / rate(shittytoken_request_duration_seconds_count[1m])",
+          "legendFormat": "avg (1m)",
+          "refId": "C"
         }
       ],
-      "title": "Cumulative Cost Over Time",
+      "title": "Per-Request Latency (1m window)",
       "type": "timeseries"
     }
   ],
