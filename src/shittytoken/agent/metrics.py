@@ -93,10 +93,10 @@ async def aggregate_metrics(
     kv_cache_values: list[float] = []
 
     for metrics in raw_results:
-        total_running += int(metrics.get("num_requests_running", 0))
-        total_waiting += int(metrics.get("num_requests_waiting", 0))
-        if "gpu_cache_usage_perc" in metrics:
-            kv_cache_values.append(metrics["gpu_cache_usage_perc"])
+        total_running += int(metrics.get("vllm:num_requests_running", metrics.get("num_requests_running", 0)))
+        total_waiting += int(metrics.get("vllm:num_requests_waiting", metrics.get("num_requests_waiting", 0)))
+        if "vllm:gpu_cache_usage_perc" in metrics or "gpu_cache_usage_perc" in metrics:
+            kv_cache_values.append(metrics.get("vllm:gpu_cache_usage_perc", metrics.get("gpu_cache_usage_perc", 0.0)))
 
     avg_kv = sum(kv_cache_values) / len(kv_cache_values) if kv_cache_values else 0.0
 

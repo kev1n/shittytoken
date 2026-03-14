@@ -388,7 +388,6 @@ class VastAIProvider(GPUProvider):
             o for o in raw_offers
             if o.get("gpu_name", "").lower() in gpu_names_lower
             and int(o.get("num_gpus", 0)) >= min_gpus
-            and float(o.get("gpu_frac", 1.0)) >= 1.0  # no shared GPUs
         ]
 
         offers = [self._to_gpu_offer(o) for o in raw_offers]
@@ -714,7 +713,7 @@ class VastAIProvider(GPUProvider):
         import time as _time
 
         vol_cfg = cfg.get("orchestrator", {}).get("volume_cache", {})
-        label_prefix = vol_cfg.get("label_prefix", "st-cache")
+        label_prefix = vol_cfg.get("label_prefix", "stcache")
         volumes = await self.list_volumes()
         now = _time.time()
         evicted = 0
@@ -724,17 +723,11 @@ class VastAIProvider(GPUProvider):
             if not label.startswith(label_prefix):
                 continue
 
-            # Use end_date (last use) or start_date as reference
-            # Vast.ai timestamps are epoch floats
             last_used = vol.get("end_date") or vol.get("start_date") or 0
             if isinstance(last_used, str):
-                continue  # skip unparseable
+                continue
             age_days = (now - last_used) / 86400.0
             if age_days > max_age_days:
-                instances = vol.get("instances", [])
-                if instances:
-                    logger.debug("vastai_volume_evict_skip_attached", volume_id=vol["id"], instances=instances)
-                    continue
                 logger.info("vastai_volume_evicting", volume_id=vol["id"], age_days=round(age_days, 1), machine_id=vol.get("machine_id"))
                 await self.delete_volume(vol["id"])
                 evicted += 1

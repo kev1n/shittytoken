@@ -28,6 +28,7 @@ _UNHEALTHY_THRESHOLD = 3
 class WorkerState:
     url: str
     requests_running: int = 0
+    requests_waiting: int = 0
     kv_cache_pct: float = 0.0
     healthy: bool = True
     added_at: float = field(default_factory=time.monotonic)
@@ -83,12 +84,14 @@ class WorkerPool:
         url: str,
         requests_running: int,
         kv_cache_pct: float,
+        requests_waiting: int = 0,
     ) -> None:
         """Update load metrics for a worker (called by background scraper)."""
         worker = self._workers.get(url)
         if worker is None:
             return
         worker.requests_running = requests_running
+        worker.requests_waiting = requests_waiting
         worker.kv_cache_pct = kv_cache_pct
 
     def list_active(self) -> list[WorkerState]:
@@ -142,10 +145,11 @@ class WorkerPool:
             return
 
         parsed = parse_prometheus_text(text)
-        requests_running = int(parsed.get("num_requests_running", 0))
-        kv_cache_pct = parsed.get("vllm:kv_cache_usage_perc", 0.0)
+        requests_running = int(parsed.get("vllm:num_requests_running", parsed.get("num_requests_running", 0)))
+        requests_waiting = int(parsed.get("vllm:num_requests_waiting", parsed.get("num_requests_waiting", 0)))
+        kv_cache_pct = parsed.get("vllm:kv_cache_usage_perc", parsed.get("kv_cache_usage_perc", 0.0))
 
-        self.report_metrics(url, requests_running, kv_cache_pct)
+        self.report_metrics(url, requests_running, kv_cache_pct, requests_waiting)
 
         # Successful scrape — reset failure counter and mark healthy.
         self._consecutive_failures[url] = 0

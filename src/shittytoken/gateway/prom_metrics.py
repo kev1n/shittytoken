@@ -184,6 +184,7 @@ async def handle_metrics(request: web.Request) -> web.Response:
     # -- Per-worker metrics from pool --------------------------------------
     pool: WorkerPool | None = request.app.get("worker_pool")
     total_running = 0
+    total_waiting = 0
     if pool is not None:
         workers = pool.list_workers()
 
@@ -192,6 +193,7 @@ async def handle_metrics(request: web.Request) -> web.Response:
         lines.append("# TYPE shittytoken_worker_requests_running gauge")
         for w in workers:
             total_running += w.requests_running
+            total_waiting += w.requests_waiting
             lines.append(f'shittytoken_worker_requests_running{{url="{w.url}"}} {w.requests_running}')
 
         # Aggregate
@@ -200,7 +202,7 @@ async def handle_metrics(request: web.Request) -> web.Response:
         lines.append(f"num_requests_running {total_running}")
         lines.append("# HELP num_requests_waiting Requests waiting in queue.")
         lines.append("# TYPE num_requests_waiting gauge")
-        lines.append("num_requests_waiting 0")
+        lines.append(f"num_requests_waiting {total_waiting}")
 
         # Per-worker KV cache usage
         lines.append("# HELP shittytoken_worker_kv_cache_pct KV cache usage percentage per worker.")

@@ -55,7 +55,7 @@ vllm:
 
   worker_port: 8080
   docker_image: "vllm/vllm-openai:latest"
-  disk_gb: 50
+  disk_gb: 10
   tool_call_parser: "qwen3_coder"
   reasoning_parser: "qwen3"
   attention_backend: "FLASHINFER"
