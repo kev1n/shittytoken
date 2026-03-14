@@ -208,8 +208,146 @@
     },
 
     {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "requests",
+            "drawStyle": "line", "fillOpacity": 20, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "id": 30,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "num_requests_running",
+          "legendFormat": "running",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "num_requests_waiting",
+          "legendFormat": "waiting",
+          "refId": "B"
+        }
+      ],
+      "title": "Queue Depth (Running + Waiting)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "green", "value": 0.6 }
+            ]
+          },
+          "unit": "percentunit", "min": 0, "max": 1, "decimals": 1
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 9 },
+      "id": 31,
+      "options": {
+        "colorMode": "background", "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_prefix_cache_hits_total[5m]) / (rate(shittytoken_prefix_cache_queries_total[5m]) > 0)",
+          "legendFormat": "hit rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Prefix Cache Hit Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "hit rate",
+            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          },
+          "unit": "percentunit", "min": 0, "max": 1
+        }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 12, "y": 9 },
+      "id": 32,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_prefix_cache_hits_total[5m]) / (rate(shittytoken_prefix_cache_queries_total[5m]) > 0)",
+          "legendFormat": "cache hit rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Prefix Cache Hit Rate Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false, "axisLabel": "$/min",
+            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
+            "lineWidth": 2, "showPoints": "never", "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "currencyUSD", "decimals": 6
+        }
+      },
+      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 9 },
+      "id": 33,
+      "options": {
+        "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) / 1000000 * 2.5 / 100",
+          "legendFormat": "input",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"completion\"}[5m]) / 1000000 * 15 / 100",
+          "legendFormat": "output",
+          "refId": "B"
+        }
+      ],
+      "title": "API Revenue Rate ($/min)",
+      "type": "timeseries"
+    },
+
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
       "id": 101,
       "title": "Latency",
       "type": "row"

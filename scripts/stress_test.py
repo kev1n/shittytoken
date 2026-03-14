@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-ShittyToken Stress Test — Realistic multi-user load with varied context sizes.
+ShittyToken Stress Test — Agentic cache workload through the gateway.
 
-Simulates real API usage patterns:
-- Distribution of context sizes from quick questions to massive docs
-- Multi-turn conversations with growing, cacheable prefixes
-- ~75% of prompt tokens are cached (prior conversation turns)
-- Output is short relative to input (~150-200 tokens)
-- Mix of user personas: casual users, power users, batch processors
+Based on entropy-script3.py pattern:
+- Fetches real text from Project Gutenberg as document corpus
+- Each user has a session with a FIXED document (cacheable prefix)
+- Multi-turn agentic pipeline: extract → analyze → cross-ref → synthesize → plan
+- Context grows each turn (history appended), prefix stays cached
+- 150:1 encode:decode ratio (realistic for long-context analysis)
+- Cache hit rate ≈ (avg_turns-1)/avg_turns per session
+
+Routes through the ShittyToken gateway with auth, billing, rate limiting.
+Uses Prometheus /metrics for cache hit rate (prompt_tokens_details is broken in vLLM V1).
 
 Usage:
     uv run python scripts/stress_test.py [OPTIONS]
@@ -15,27 +19,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
 import json
+import math
 import random
+import re
 import secrets
-import string
+import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
-import aiohttp
 import asyncpg
-import structlog
-
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.dev.ConsoleRenderer(colors=True),
-    ]
-)
-logger = structlog.get_logger()
+import requests
 
 # ---------------------------------------------------------------------------
 # Config
@@ -43,381 +38,77 @@ logger = structlog.get_logger()
 
 POSTGRES_DSN = "postgresql://shittytoken:shittytoken_dev@localhost:5432/shittytoken"
 REDIS_URL = "redis://localhost:6379/0"
-BALANCE_CENTS = 1_000_000  # $10,000 per user (large context = expensive)
+BALANCE_CENTS = 10_000_000  # $100,000 per user (long context is expensive)
 
-
-# ---------------------------------------------------------------------------
-# Synthetic context generators
-# ---------------------------------------------------------------------------
-
-# ~4 chars per token on average for English text
-CHARS_PER_TOKEN = 4
-
-# Realistic code snippets used to build large contexts
-CODE_TEMPLATES = [
-    '''def {name}({args}) -> {ret}:
-    """{doc}"""
-    result = []
-    for item in {arg0}:
-        if item.{attr} > threshold:
-            processed = transform(item, mode="{mode}")
-            result.append(processed)
-    return {ret_expr}
-''',
-    '''class {name}:
-    """{doc}"""
-
-    def __init__(self, {args}):
-        self.{arg0} = {arg0}
-        self._cache = {{}}
-        self._lock = asyncio.Lock()
-
-    async def process(self, data: list[dict]) -> dict:
-        async with self._lock:
-            results = await asyncio.gather(*[
-                self._handle_item(item) for item in data
-            ])
-        return {{"items": results, "count": len(results)}}
-
-    async def _handle_item(self, item: dict) -> dict:
-        key = item.get("id", "")
-        if key in self._cache:
-            return self._cache[key]
-        result = await self._transform(item)
-        self._cache[key] = result
-        return result
-''',
-    '''async def {name}_handler(request: Request) -> Response:
-    """{doc}"""
-    body = await request.json()
-    validate_schema(body, {name}_schema)
-
-    async with get_db_session() as db:
-        existing = await db.fetch_one(
-            "SELECT * FROM {table} WHERE id = :id",
-            {{"id": body["id"]}}
-        )
-        if existing:
-            await db.execute(
-                "UPDATE {table} SET {col} = :val WHERE id = :id",
-                {{"val": body["{col}"], "id": body["id"]}}
-            )
-        else:
-            await db.execute(
-                "INSERT INTO {table} ({col}, created_at) VALUES (:val, NOW())",
-                {{"val": body["{col}"]}}
-            )
-
-    return Response(status_code=200, body={{"status": "ok"}})
-''',
+# Gutenberg books — fetched until we have enough text
+BOOK_URLS = [
+    "https://www.gutenberg.org/files/1661/1661-0.txt",   # Sherlock Holmes
+    "https://www.gutenberg.org/files/1342/1342-0.txt",   # Pride and Prejudice
+    "https://www.gutenberg.org/files/84/84-0.txt",       # Frankenstein
+    "https://www.gutenberg.org/files/2701/2701-0.txt",   # Moby Dick
 ]
 
-NAMES = ["process_batch", "DataPipeline", "UserService", "MetricsAggregator",
-         "handle_webhook", "sync_records", "validate_config", "transform_output",
-         "CacheManager", "EventProcessor", "QueryOptimizer", "load_balancer"]
-ATTRS = ["score", "priority", "timestamp", "status", "weight", "confidence"]
-MODES = ["strict", "relaxed", "batch", "streaming", "incremental"]
-TABLES = ["users", "events", "metrics", "configs", "sessions", "audit_log"]
-COLS = ["data", "payload", "metadata", "state", "result", "content"]
-
-
-def _gen_code_block() -> str:
-    """Generate a realistic-looking code block (~200-500 chars)."""
-    tmpl = random.choice(CODE_TEMPLATES)
-    name = random.choice(NAMES)
-    return tmpl.format(
-        name=name,
-        args="self, data, threshold=0.5",
-        arg0="data",
-        ret="list",
-        doc=f"Process {name} with validation and error handling.",
-        attr=random.choice(ATTRS),
-        mode=random.choice(MODES),
-        ret_expr="result",
-        table=random.choice(TABLES),
-        col=random.choice(COLS),
-    )
-
-
-def _gen_prose_paragraph() -> str:
-    """Generate realistic technical prose (~100-300 chars)."""
-    topics = [
-        "The system architecture follows a microservices pattern with event-driven communication between components. Each service maintains its own data store and communicates through an async message bus. This ensures loose coupling and independent deployability.",
-        "Performance testing revealed that the primary bottleneck occurs during concurrent database writes when the connection pool is exhausted. We implemented connection pooling with PgBouncer and added retry logic with exponential backoff to handle transient failures.",
-        "The deployment pipeline consists of three stages: build, test, and deploy. Each stage runs in an isolated container to ensure reproducibility. The test stage includes unit tests, integration tests, and a synthetic load test that must pass before promotion to production.",
-        "Error handling follows a hierarchical pattern where domain-specific exceptions are caught at the service layer, logged with full context, and translated to appropriate HTTP status codes at the API boundary. All errors include correlation IDs for distributed tracing.",
-        "The caching strategy uses a two-tier approach: an in-process LRU cache for frequently accessed small objects, and a distributed Redis cache for larger computed results. Cache invalidation is event-driven through the message bus to maintain consistency across instances.",
-        "Authentication uses JWT tokens with short expiry times and refresh token rotation. Each API request is validated against the token's scope and rate-limited per user. Service-to-service communication uses mutual TLS with certificate rotation managed by the platform.",
-        "The monitoring stack includes Prometheus for metrics collection, Grafana for visualization, and structured logging with correlation IDs. Alerts are configured for SLO violations with a 5-minute evaluation window and PagerDuty integration for critical incidents.",
-        "Database migrations are managed through versioned scripts that support both forward and backward migrations. Each migration is tested against a snapshot of production data before deployment. Schema changes that require table locks are executed during maintenance windows.",
-    ]
-    return random.choice(topics)
-
-
-def generate_context_padding(target_tokens: int) -> str:
-    """Generate realistic-looking context to reach a target token count.
-
-    Mixes code blocks and prose to simulate a user pasting a codebase
-    or document into a conversation.
-    """
-    target_chars = target_tokens * CHARS_PER_TOKEN
-    parts: list[str] = []
-    current_chars = 0
-
-    while current_chars < target_chars:
-        # 60% code, 40% prose
-        if random.random() < 0.6:
-            block = _gen_code_block()
-        else:
-            block = _gen_prose_paragraph()
-        parts.append(block)
-        current_chars += len(block)
-
-    text = "\n\n".join(parts)
-    # Trim to approximate target
-    return text[:target_chars]
-
-
-# ---------------------------------------------------------------------------
-# Dataset loader
-# ---------------------------------------------------------------------------
-
-def load_nemotron_prompts(max_rows: int = 500) -> list[str]:
-    """Stream & extract user prompts from the Nemotron RL blend JSONL."""
-    from huggingface_hub import hf_hub_url, get_token
-    import requests as req
-
-    logger.info("dataset.streaming", name="nvidia/Nemotron-3-Nano-RL-Training-Blend", max_rows=max_rows)
-
-    url = hf_hub_url(
-        repo_id="nvidia/Nemotron-3-Nano-RL-Training-Blend",
-        filename="train.jsonl",
-        repo_type="dataset",
-    )
-    headers = {}
-    token = get_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    prompts: list[str] = []
-    lines_read = 0
-
-    with req.get(url, headers=headers, stream=True, timeout=30) as resp:
-        resp.raise_for_status()
-        buf = b""
-        for chunk in resp.iter_content(chunk_size=64 * 1024):
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                lines_read += 1
-
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                params = row.get("responses_create_params")
-                if not params:
-                    continue
-                if isinstance(params, str):
-                    try:
-                        params = json.loads(params)
-                    except json.JSONDecodeError:
-                        continue
-
-                messages_raw = params.get("input", [])
-                if not messages_raw:
-                    continue
-
-                user_parts = [
-                    m.get("content", "")
-                    for m in messages_raw
-                    if m.get("role") == "user" and m.get("content")
-                ]
-                if user_parts:
-                    prompts.append(" ".join(user_parts)[:4000])
-
-                if len(prompts) >= max_rows:
-                    break
-            if len(prompts) >= max_rows:
-                break
-
-    logger.info("dataset.prompts_extracted", count=len(prompts), lines_read=lines_read)
-    return prompts
-
-
-# ---------------------------------------------------------------------------
-# User personas — different usage patterns
-# ---------------------------------------------------------------------------
-
-@dataclass
-class UserPersona:
-    """Defines how a user interacts with the API."""
-    name: str
-    # Token count range for context (min, max)
-    context_range: tuple[int, int]
-    # Probability weights for context size buckets
-    max_turns: tuple[int, int]
-    # How often they continue vs start new conversations
-    continue_prob: float
-    # Max output tokens
-    max_tokens: int
-    # Weight for how often this persona appears
-    weight: float
-
-
-PERSONAS = [
-    UserPersona(
-        name="casual",
-        context_range=(500, 5_000),
-        max_turns=(2, 4),
-        continue_prob=0.5,
-        max_tokens=200,
-        weight=0.35,
+# Agentic task pipeline — cycles through these
+AGENT_TASKS = [
+    (
+        "Extract",
+        "List the 3 most important named entities (people, places, or organizations) "
+        "from the NEW section of the document added this round. "
+        "Output only the names, one per line, nothing else."
     ),
-    UserPersona(
-        name="developer",
-        context_range=(2_000, 30_000),
-        max_turns=(3, 8),
-        continue_prob=0.7,
-        max_tokens=300,
-        weight=0.30,
+    (
+        "Analyze",
+        "Using the entities just extracted, identify which one plays the most pivotal "
+        "role in this section and explain why in exactly one sentence."
     ),
-    UserPersona(
-        name="power_user",
-        context_range=(10_000, 80_000),
-        max_turns=(4, 10),
-        continue_prob=0.8,
-        max_tokens=200,
-        weight=0.20,
+    (
+        "CrossRef",
+        "Find one direct quote from the document that best illustrates the main "
+        "conflict or tension in this section. Quote it exactly, under 20 words."
     ),
-    UserPersona(
-        name="batch_processor",
-        context_range=(50_000, 131_000),
-        max_turns=(1, 3),
-        continue_prob=0.3,
-        max_tokens=500,
-        weight=0.15,
+    (
+        "Synthesize",
+        "In exactly two sentences: summarize what occurred in this section and how "
+        "it connects to the key entity identified above."
+    ),
+    (
+        "Plan",
+        "Given everything analyzed so far, state in one sentence the single most "
+        "important question an investigator should pursue next."
     ),
 ]
 
 
-def pick_persona() -> UserPersona:
-    weights = [p.weight for p in PERSONAS]
-    return random.choices(PERSONAS, weights=weights, k=1)[0]
+# ---------------------------------------------------------------------------
+# Corpus
+# ---------------------------------------------------------------------------
+
+def fetch_corpus(target_chars: int) -> str:
+    """Download Gutenberg books until we have enough text."""
+    corpus = ""
+    for url in BOOK_URLS:
+        if len(corpus) >= target_chars:
+            break
+        try:
+            print(f"  Fetching {url} ...")
+            r = requests.get(url, timeout=30)
+            text = r.text
+            start = text.find("*** START OF")
+            if start != -1:
+                text = text[text.find("\n", start)+1:]
+            end = text.find("*** END OF")
+            if end != -1:
+                text = text[:end]
+            text = re.sub(r'\n{3,}', '\n\n', text).strip()
+            corpus += "\n\n" + text
+            print(f"    {len(text):,} chars (~{len(text)//4:,} tokens)")
+        except Exception as e:
+            print(f"    Failed: {e}")
+    return corpus[:target_chars]
 
 
 # ---------------------------------------------------------------------------
-# Conversation simulator
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Conversation:
-    """Multi-turn conversation with growing, cacheable context."""
-    system_prompt: str
-    persona: UserPersona
-    turns: list[dict[str, str]] = field(default_factory=list)
-    turn_count: int = 0
-    max_turns: int = 5
-    # The initial context document (stays constant = cacheable prefix)
-    context_doc: str = ""
-
-    @property
-    def is_finished(self) -> bool:
-        return self.turn_count >= self.max_turns
-
-    def build_messages(self, user_message: str) -> list[dict[str, str]]:
-        """Build message array. System + context_doc + prior turns = cacheable prefix."""
-        messages = [{"role": "system", "content": self.system_prompt}]
-        if self.context_doc:
-            messages.append({
-                "role": "user",
-                "content": f"Here is the context I'm working with:\n\n{self.context_doc}",
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "I've reviewed the context. What would you like to know?",
-            })
-        messages.extend(self.turns)
-        messages.append({"role": "user", "content": user_message})
-        return messages
-
-    def record_response(self, user_message: str, assistant_response: str) -> None:
-        self.turns.append({"role": "user", "content": user_message})
-        self.turns.append({"role": "assistant", "content": assistant_response})
-        self.turn_count += 1
-
-
-SYSTEM_PROMPTS = [
-    "You are a helpful coding assistant. Give concise, working code examples.",
-    "You are a data analysis expert. Provide clear summaries and insights.",
-    "You are a technical writer helping document software APIs.",
-    "You are a DevOps engineer helping with infrastructure.",
-    "You are a security researcher. Analyze code for vulnerabilities.",
-    "You are a database expert. Help with query optimization and schema design.",
-    "You are a machine learning engineer helping with model deployment.",
-    "You are a software architect reviewing system designs.",
-]
-
-FOLLOWUPS = [
-    "Can you expand on that last point?",
-    "How would I test this?",
-    "What are the edge cases I should handle?",
-    "Can you refactor that to be more efficient?",
-    "What would the error handling look like?",
-    "How would this work at scale?",
-    "What are the security implications?",
-    "How would I monitor this in production?",
-    "Can you write a unit test for that?",
-    "What's the performance impact of this approach?",
-    "How does this compare to the alternative?",
-    "What configuration would you recommend for production?",
-    "Can you explain the tradeoffs here?",
-    "What would a migration plan look like?",
-    "How should I handle backwards compatibility?",
-]
-
-
-def create_conversation(prompts: list[str], persona: UserPersona) -> Conversation:
-    """Create a conversation with context sized to the persona."""
-    target_tokens = random.randint(*persona.context_range)
-    context_doc = ""
-    if target_tokens > 1000:
-        context_doc = generate_context_padding(target_tokens)
-
-    return Conversation(
-        system_prompt=random.choice(SYSTEM_PROMPTS),
-        persona=persona,
-        max_turns=random.randint(*persona.max_turns),
-        context_doc=context_doc,
-    )
-
-
-def get_user_message(conv: Conversation, prompts: list[str]) -> str:
-    if conv.turn_count == 0:
-        prompt = random.choice(prompts)
-        if conv.context_doc:
-            questions = [
-                "Can you review this code and suggest improvements?",
-                "What are the main issues with this implementation?",
-                "How would you refactor this for better performance?",
-                "Can you explain how this system works?",
-                "What tests should I write for this?",
-                "Are there any security vulnerabilities here?",
-                "How would you add error handling to this?",
-                "What's the time complexity of the main operations?",
-            ]
-            return random.choice(questions)
-        return prompt[:2000]
-    else:
-        return random.choice(FOLLOWUPS)
-
-
-# ---------------------------------------------------------------------------
-# User provisioning
+# User provisioning (sync version for simplicity)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -425,21 +116,22 @@ class VirtualUser:
     email: str
     user_id: str
     api_key: str
-    key_hash: str
-    persona: UserPersona
 
 
-async def provision_users(num_users: int) -> list[VirtualUser]:
+def provision_users_sync(num_users: int) -> list[VirtualUser]:
+    """Create test users with API keys and balance using sync pg."""
+    import asyncio
+    return asyncio.run(_provision_users_async(num_users))
+
+
+async def _provision_users_async(num_users: int) -> list[VirtualUser]:
     import redis.asyncio as aioredis
-
     pool = await asyncpg.create_pool(POSTGRES_DSN)
     r = aioredis.from_url(REDIS_URL)
+    users = []
 
-    users: list[VirtualUser] = []
     for i in range(num_users):
         email = f"stresstest-{i:04d}@shittytoken.test"
-        persona = pick_persona()
-
         row = await pool.fetchrow("SELECT id FROM users WHERE email = $1", email)
         if row:
             user_id = str(row["id"])
@@ -451,337 +143,382 @@ async def provision_users(num_users: int) -> list[VirtualUser]:
 
         plaintext = f"sk-st-stress-{secrets.token_hex(16)}"
         key_hash = hashlib.sha256(plaintext.encode()).hexdigest()
-
         await pool.execute(
             "INSERT INTO api_keys (key_hash, user_id, name) VALUES ($1, $2, $3) "
             "ON CONFLICT (key_hash) DO NOTHING",
-            key_hash,
-            row["id"],
-            f"stress-test-{i}",
+            key_hash, row["id"], f"stress-test-{i}",
         )
         await r.set(f"balance:{user_id}", str(BALANCE_CENTS))
-
-        users.append(VirtualUser(
-            email=email, user_id=user_id, api_key=plaintext,
-            key_hash=key_hash, persona=persona,
-        ))
+        users.append(VirtualUser(email=email, user_id=user_id, api_key=plaintext))
 
     await pool.close()
     await r.aclose()
-
-    persona_counts = {}
-    for u in users:
-        persona_counts[u.persona.name] = persona_counts.get(u.persona.name, 0) + 1
-    logger.info("users.provisioned", count=len(users), personas=persona_counts)
     return users
 
 
 # ---------------------------------------------------------------------------
-# Stats
+# Chat completion (streaming, through gateway)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class RequestStats:
-    started_at: float = 0.0
-    total_requests: int = 0
-    success: int = 0
-    failed: int = 0
-    timeouts: int = 0
-    rate_limited: int = 0
-    total_prompt_tokens: int = 0
-    total_completion_tokens: int = 0
-    latencies: list[float] = field(default_factory=list)
-    ttfts: list[float] = field(default_factory=list)
-    # Track context size distribution
-    context_buckets: dict[str, int] = field(default_factory=lambda: {
-        "tiny(<1k)": 0, "small(1-5k)": 0, "med(5-30k)": 0,
-        "large(30-80k)": 0, "huge(80k+)": 0,
-    })
-
-    def _bucket(self, tokens: int) -> str:
-        if tokens < 1000:
-            return "tiny(<1k)"
-        if tokens < 5000:
-            return "small(1-5k)"
-        if tokens < 30000:
-            return "med(5-30k)"
-        if tokens < 80000:
-            return "large(30-80k)"
-        return "huge(80k+)"
-
-    def record(
-        self,
-        success: bool,
-        duration: float,
-        ttft: float | None,
-        prompt_tokens: int,
-        completion_tokens: int,
-        status_code: int | None = None,
-    ) -> None:
-        self.total_requests += 1
-        self.latencies.append(duration)
-        if success:
-            self.success += 1
-            self.total_prompt_tokens += prompt_tokens
-            self.total_completion_tokens += completion_tokens
-            if ttft is not None:
-                self.ttfts.append(ttft)
-            bucket = self._bucket(prompt_tokens)
-            self.context_buckets[bucket] = self.context_buckets.get(bucket, 0) + 1
-        elif status_code == 429:
-            self.rate_limited += 1
-            self.failed += 1
-        else:
-            self.failed += 1
-
-    def summary(self) -> dict[str, Any]:
-        elapsed = time.monotonic() - self.started_at if self.started_at else 0
-        rps = self.total_requests / elapsed if elapsed > 0 else 0
-
-        sorted_lat = sorted(self.latencies) if self.latencies else [0]
-        sorted_ttft = sorted(self.ttfts) if self.ttfts else [0]
-
-        tps = (self.total_prompt_tokens + self.total_completion_tokens) / elapsed if elapsed > 0 else 0
-
-        return {
-            "elapsed_s": round(elapsed, 1),
-            "total": self.total_requests,
-            "ok": self.success,
-            "fail": self.failed,
-            "rate_limited": self.rate_limited,
-            "rps": round(rps, 2),
-            "tps": round(tps, 0),
-            "lat_p50": round(sorted_lat[len(sorted_lat) // 2], 2),
-            "lat_p95": round(sorted_lat[int(len(sorted_lat) * 0.95)], 2),
-            "ttft_p50": round(sorted_ttft[len(sorted_ttft) // 2], 2),
-            "ttft_p95": round(sorted_ttft[int(len(sorted_ttft) * 0.95)], 2),
-            "in_tok": self.total_prompt_tokens,
-            "out_tok": self.total_completion_tokens,
-            "buckets": dict(self.context_buckets),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Request sender
-# ---------------------------------------------------------------------------
-
-async def send_request(
-    session: aiohttp.ClientSession,
+def chat_completion(
     gateway_url: str,
-    user: VirtualUser,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    request_timeout: float,
-    stats: RequestStats,
-) -> str:
-    """Send a streaming chat completion. Returns the assistant's response text."""
-    url = f"{gateway_url.rstrip('/')}/v1/chat/completions"
+    api_key: str,
+    messages: list[dict],
+    max_tokens: int = 64,
+) -> dict:
+    """Send a streaming chat completion through the gateway."""
     payload = {
         "messages": messages,
         "max_tokens": max_tokens,
+        "temperature": 0.0,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    headers = {"Authorization": f"Bearer {user.api_key}"}
-    timeout = aiohttp.ClientTimeout(total=request_timeout, connect=10)
-    send_time = time.monotonic()
+    headers = {"Authorization": f"Bearer {api_key}"}
+    t0 = time.time()
+    ttft_ms = None
+    content = ""
+    usage = {}
 
-    ttft: float | None = None
-    prompt_tokens = 0
-    completion_tokens = 0
-    output_parts: list[str] = []
-    status_code: int | None = None
+    with requests.post(
+        f"{gateway_url.rstrip('/')}/v1/chat/completions",
+        json=payload, headers=headers, stream=True, timeout=300,
+    ) as resp:
+        if resp.status_code != 200:
+            return {"error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            if line.startswith(b"data: "):
+                line = line[6:]
+            if line == b"[DONE]":
+                break
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "error" in chunk:
+                return chunk
+            delta = ((chunk.get("choices") or [{}])[0]).get("delta", {})
+            token = delta.get("content") or delta.get("reasoning_content") or ""
+            if token and ttft_ms is None:
+                ttft_ms = (time.time() - t0) * 1000
+            content += delta.get("content") or ""
+            if chunk.get("usage"):
+                usage = chunk["usage"]
 
-    try:
-        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-            status_code = resp.status
-            if resp.status != 200:
-                duration = time.monotonic() - send_time
-                stats.record(False, duration, None, 0, 0, status_code=status_code)
-                return ""
-
-            async for raw_line in resp.content:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[len("data: "):]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                usage = chunk.get("usage")
-                if usage:
-                    prompt_tokens = usage.get("prompt_tokens", 0)
-                    completion_tokens = usage.get("completion_tokens", 0)
-
-                try:
-                    delta = chunk["choices"][0]["delta"]
-                    content = delta.get("content", "")
-                    reasoning = delta.get("reasoning_content", "")
-                except (KeyError, IndexError, TypeError):
-                    continue
-
-                if content or reasoning:
-                    if ttft is None:
-                        ttft = time.monotonic() - send_time
-                if content:
-                    output_parts.append(content)
-
-            duration = time.monotonic() - send_time
-            stats.record(True, duration, ttft, prompt_tokens, completion_tokens)
-            return "".join(output_parts)
-
-    except asyncio.TimeoutError:
-        duration = time.monotonic() - send_time
-        stats.timeouts += 1
-        stats.record(False, duration, None, 0, 0)
-        return ""
-    except (aiohttp.ClientError, ConnectionError):
-        duration = time.monotonic() - send_time
-        stats.record(False, duration, None, 0, 0)
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# Load driver
-# ---------------------------------------------------------------------------
-
-async def run_stress_test(
-    gateway_url: str,
-    users: list[VirtualUser],
-    prompts: list[str],
-    max_concurrency: int,
-    ramp_steps: int,
-    step_duration: float,
-    request_timeout: float,
-) -> None:
-    """Ramp up load with realistic conversation patterns and context sizes."""
-    stats = RequestStats()
-    stats.started_at = time.monotonic()
-
-    user_conversations: dict[str, list[Conversation]] = {
-        u.user_id: [] for u in users
+    total_ms = (time.time() - t0) * 1000
+    return {
+        "choices": [{"message": {"content": content}}],
+        "usage": usage,
+        "_elapsed_ms": total_ms,
+        "_ttft_ms": ttft_ms if ttft_ms is not None else total_ms,
     }
 
-    connector = aiohttp.TCPConnector(limit=max_concurrency + 10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        levels = [
-            max(1, int(max_concurrency * (i + 1) / ramp_steps))
-            for i in range(ramp_steps)
-        ]
 
-        for step_idx, concurrency in enumerate(levels):
-            step_start = time.monotonic()
-            logger.info(
-                "ramp.step_start",
-                step=f"{step_idx + 1}/{ramp_steps}",
-                concurrency=concurrency,
-                elapsed_s=round(time.monotonic() - stats.started_at, 1),
-            )
+# ---------------------------------------------------------------------------
+# Prometheus cache counters
+# ---------------------------------------------------------------------------
 
-            sem = asyncio.Semaphore(concurrency)
-            tasks: list[asyncio.Task] = []
-            stop_event = asyncio.Event()
+def get_prometheus_cache(worker_urls: list[str]) -> tuple[float, float]:
+    """Scrape prefix cache hits/queries from all workers."""
+    total_hits = 0.0
+    total_queries = 0.0
+    for url in worker_urls:
+        try:
+            text = requests.get(f"{url}/metrics", timeout=5).text
+            hits = re.search(r'vllm:prefix_cache_hits_total\{[^}]*\}\s+([\d.e+]+)', text)
+            queries = re.search(r'vllm:prefix_cache_queries_total\{[^}]*\}\s+([\d.e+]+)', text)
+            if hits:
+                total_hits += float(hits.group(1))
+            if queries:
+                total_queries += float(queries.group(1))
+        except Exception:
+            pass
+    return total_hits, total_queries
 
-            async def _worker(worker_id: int) -> None:
-                while not stop_event.is_set():
-                    async with sem:
-                        if stop_event.is_set():
-                            break
 
-                        user = random.choice(users)
-                        persona = user.persona
+def get_worker_urls(gateway_url: str) -> list[str]:
+    """Get worker URLs from gateway admin API."""
+    try:
+        resp = requests.get(f"{gateway_url.rstrip('/')}/admin/workers", timeout=5)
+        workers = resp.json()
+        return [w["url"] for w in workers if isinstance(w, dict)]
+    except Exception:
+        return []
 
-                        convs = user_conversations[user.user_id]
-                        convs[:] = [c for c in convs if not c.is_finished]
 
-                        conv: Conversation
-                        if convs and random.random() < persona.continue_prob:
-                            conv = random.choice(convs)
-                        else:
-                            conv = create_conversation(prompts, persona)
-                            convs.append(conv)
+# ---------------------------------------------------------------------------
+# Result tracking
+# ---------------------------------------------------------------------------
 
-                        user_msg = get_user_message(conv, prompts)
-                        messages = conv.build_messages(user_msg)
-
-                        response = await send_request(
-                            session, gateway_url, user, messages,
-                            persona.max_tokens, request_timeout, stats,
-                        )
-
-                        if response:
-                            conv.record_response(user_msg, response[:500])
-
-            for i in range(concurrency):
-                tasks.append(asyncio.create_task(_worker(i)))
-
-            step_elapsed = 0.0
-            log_interval = 10.0
-            while step_elapsed < step_duration:
-                wait_time = min(log_interval, step_duration - step_elapsed)
-                await asyncio.sleep(wait_time)
-                step_elapsed = time.monotonic() - step_start
-                logger.info("stats.snapshot", **stats.summary())
-
-            stop_event.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-            logger.info(
-                "ramp.step_complete",
-                step=f"{step_idx + 1}/{ramp_steps}",
-                concurrency=concurrency,
-                **stats.summary(),
-            )
-
-    logger.info("stress_test.complete", **stats.summary())
+@dataclass
+class Result:
+    user_num: int
+    session_num: int
+    session_req: int
+    task: str
+    prompt_tokens: int
+    completion_tokens: int
+    ttft_ms: float
+    elapsed_ms: float
+    output: str
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def main() -> None:
+def run():
     parser = argparse.ArgumentParser(description="ShittyToken Stress Test")
     parser.add_argument("--gateway-url", default="http://localhost:8001")
-    parser.add_argument("--num-users", type=int, default=50)
-    parser.add_argument("--max-concurrency", type=int, default=100)
-    parser.add_argument("--ramp-steps", type=int, default=6)
-    parser.add_argument("--step-duration", type=float, default=90.0)
-    parser.add_argument("--request-timeout", type=float, default=300.0,
-                        help="Timeout per request (large contexts need more time)")
+    parser.add_argument("--users", type=int, default=10)
+    parser.add_argument("--duration", type=int, default=300, help="Run duration in seconds")
+    parser.add_argument("--doc-tokens-min", type=int, default=500)
+    parser.add_argument("--doc-tokens-max", type=int, default=95000)
+    parser.add_argument("--session-min-turns", type=int, default=3)
+    parser.add_argument("--session-max-turns", type=int, default=12)
+    parser.add_argument("--session-max-tokens", type=int, default=100000)
+    parser.add_argument("--encode-decode-ratio", type=int, default=150)
+    parser.add_argument("--start-jitter", type=int, default=15)
     args = parser.parse_args()
 
-    logger.info(
-        "stress_test.config",
-        gateway_url=args.gateway_url,
-        num_users=args.num_users,
-        max_concurrency=args.max_concurrency,
-        ramp_steps=args.ramp_steps,
-        step_duration_s=args.step_duration,
-        personas={p.name: f"{p.context_range[0]}-{p.context_range[1]}tok, weight={p.weight}" for p in PERSONAS},
+    GATEWAY_URL = args.gateway_url
+    USERS = args.users
+    RUN_DURATION_S = args.duration
+    DOC_TOKENS_MIN = args.doc_tokens_min
+    DOC_TOKENS_MAX = args.doc_tokens_max
+    SESSION_MIN_TURNS = args.session_min_turns
+    SESSION_MAX_TURNS = args.session_max_turns
+    SESSION_MAX_TOKENS = args.session_max_tokens
+    ENCODE_DECODE_RATIO = args.encode_decode_ratio
+    START_JITTER_S = args.start_jitter
+
+    print("=" * 80)
+    print("SHITTYTOKEN AGENTIC CACHE WORKLOAD TEST")
+    print(f"  Gateway:           {GATEWAY_URL}")
+    print(f"  Users:             {USERS}")
+    print(f"  Duration:          {RUN_DURATION_S}s")
+    print(f"  Doc size/session:  {DOC_TOKENS_MIN:,}–{DOC_TOKENS_MAX:,} tokens")
+    print(f"  Session turns:     {SESSION_MIN_TURNS}–{SESSION_MAX_TURNS}")
+    print(f"  Encode:decode:     {ENCODE_DECODE_RATIO}:1")
+    print(f"  Start jitter:      0–{START_JITTER_S}s")
+    print("=" * 80 + "\n")
+
+    # Provision users
+    print("Provisioning virtual users...")
+    users = provision_users_sync(USERS)
+    print(f"  {len(users)} users ready\n")
+
+    # Fetch corpus
+    target_chars = DOC_TOKENS_MAX * 8  # 2x headroom
+    print(f"Fetching corpus (~{target_chars//4:,} tokens needed)...")
+    corpus = fetch_corpus(target_chars)
+    print(f"Corpus: {len(corpus):,} chars (~{len(corpus)//4:,} tokens)\n")
+
+    # Get worker URLs for Prometheus scraping
+    worker_urls = get_worker_urls(GATEWAY_URL)
+    print(f"Workers: {worker_urls}\n")
+    prom_start = get_prometheus_cache(worker_urls)
+
+    system_header = (
+        "You are a document analysis agent working through a long document. "
+        "Each request, new document sections are appended below. "
+        "Respond concisely — your output will become context for your next request.\n\n"
+        "=== DOCUMENT ===\n"
     )
 
-    prompts = load_nemotron_prompts()
-    if not prompts:
-        logger.error("No prompts loaded from dataset!")
-        return
+    results: list[Result] = []
+    results_lock = threading.Lock()
+    stop_event = threading.Event()
+    stop_reason = "Time limit reached"
 
-    users = await provision_users(args.num_users)
+    print(f"{'U':>2} {'Ses':>3} {'Req':>4}  {'Task':<10} {'Prompt':>8} {'Out':>4} {'TTFT':>7} {'Total':>7}  {'tok/s':>6}")
+    print("-" * 75)
+    run_start = time.time()
 
-    await run_stress_test(
-        gateway_url=args.gateway_url,
-        users=users,
-        prompts=prompts,
-        max_concurrency=args.max_concurrency,
-        ramp_steps=args.ramp_steps,
-        step_duration=args.step_duration,
-        request_timeout=args.request_timeout,
-    )
+    timer = threading.Timer(RUN_DURATION_S, stop_event.set)
+    timer.daemon = True
+    timer.start()
+
+    def user_workflow(user_idx: int):
+        nonlocal stop_reason
+        user = users[user_idx]
+        time.sleep(random.uniform(0, START_JITTER_S))
+
+        session_num = 0
+        while not stop_event.is_set():
+            session_num += 1
+            doc_tokens = random.randint(DOC_TOKENS_MIN, DOC_TOKENS_MAX)
+            doc_chars = doc_tokens * 4
+            # Random position in corpus for this session's document
+            doc_start = random.randint(0, max(0, len(corpus) - doc_chars))
+            current_doc = corpus[doc_start:doc_start + doc_chars]
+            session_len = random.randint(SESSION_MIN_TURNS, SESSION_MAX_TURNS)
+            system_prompt = system_header + current_doc
+            history: list[dict] = []
+            task_idx = random.randint(0, len(AGENT_TASKS) - 1)
+            session_req = 0
+
+            for _ in range(session_len):
+                if stop_event.is_set():
+                    break
+
+                approx_prompt = (len(system_prompt) + sum(len(m["content"]) for m in history)) // 4
+                max_gen = max(1, approx_prompt // ENCODE_DECODE_RATIO)
+
+                task_label, task_prompt = AGENT_TASKS[task_idx % len(AGENT_TASKS)]
+                task_idx += 1
+                session_req += 1
+
+                msgs = [{"role": "system", "content": system_prompt}]
+                msgs += history
+                msgs.append({"role": "user", "content": task_prompt})
+
+                try:
+                    resp = chat_completion(GATEWAY_URL, user.api_key, msgs, max_tokens=max_gen)
+                except Exception as e:
+                    stop_event.set()
+                    with results_lock:
+                        if stop_reason == "Time limit reached":
+                            stop_reason = f"Request error (user {user_idx}): {e}"
+                    return
+
+                if "error" in resp:
+                    # Non-fatal: log and continue (might be rate limit, etc.)
+                    with results_lock:
+                        print(f"  [user {user_idx}] Error: {str(resp['error'])[:100]}")
+                    continue
+
+                usage = resp.get("usage") or {}
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                elapsed_ms = resp.get("_elapsed_ms", 0.0)
+                ttft_ms = resp.get("_ttft_ms", 0.0)
+                msg = ((resp.get("choices") or [{}])[0].get("message") or {})
+                output = msg.get("content") or ""
+
+                decode_ms = elapsed_ms - ttft_ms
+                toks_per_s = (completion_tokens / decode_ms * 1000) if decode_ms > 0 else 0.0
+
+                result = Result(
+                    user_num=user_idx, session_num=session_num,
+                    session_req=session_req, task=task_label,
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    ttft_ms=ttft_ms, elapsed_ms=elapsed_ms, output=output,
+                )
+                with results_lock:
+                    results.append(result)
+                    print(
+                        f"{user_idx:>2} {session_num:>3} {session_req:>4}  {task_label:<10} "
+                        f"{prompt_tokens:>8,} {completion_tokens:>4} {ttft_ms:>6.0f}ms {elapsed_ms:>6.0f}ms"
+                        f"  {toks_per_s:>5.1f}/s"
+                        + ("  ← new session" if session_req == 1 else "")
+                    )
+
+                history.append({"role": "user", "content": task_prompt})
+                history.append({"role": "assistant", "content": output})
+
+                if prompt_tokens >= SESSION_MAX_TOKENS:
+                    break
+
+    threads = [threading.Thread(target=user_workflow, args=(i,), daemon=True)
+               for i in range(USERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    timer.cancel()
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    wall_ms = (time.time() - run_start) * 1000
+    total_prompt = sum(r.prompt_tokens for r in results)
+    total_completion = sum(r.completion_tokens for r in results)
+    avg_ttft_ms = sum(r.ttft_ms for r in results) / len(results) if results else 0
+    avg_elapsed_ms = sum(r.elapsed_ms for r in results) / len(results) if results else 0
+
+    # Cache stats from Prometheus delta
+    prom_end = get_prometheus_cache(worker_urls)
+    prom_queries = prom_end[1] - prom_start[1]
+    prom_hits = prom_end[0] - prom_start[0]
+    hit_rate = (prom_hits / prom_queries) if prom_queries > 0 else 0.0
+    total_cached = int(total_prompt * hit_rate)
+    total_uncached = total_prompt - total_cached
+
+    avg_prompt = total_prompt / len(results) if results else 0
+    avg_completion = total_completion / len(results) if results else 0
+    actual_ratio = (avg_prompt / avg_completion) if avg_completion > 0 else 0
+
+    # Billing estimate
+    pricing_input = 2.5   # cents per 1M tokens
+    pricing_output = 15.0  # cents per 1M tokens
+    input_cost = total_prompt / 1_000_000 * pricing_input
+    output_cost = total_completion / 1_000_000 * pricing_output
+    total_cost = input_cost + output_cost
+
+    print("\n" + "=" * 80)
+    print(f"STOP: {stop_reason}\n")
+    print(f"  Total requests:              {len(results)}")
+    print(f"  Wall time:                   {wall_ms/1000:.1f}s\n")
+    print(f"  ── Token accounting ──")
+    print(f"  Total prompt tokens:         {total_prompt:>12,}")
+    print(f"    Cached (KV hit):           {total_cached:>12,}  ({hit_rate*100:.1f}%)")
+    print(f"    Uncached (prefilled):      {total_uncached:>12,}  ({(1-hit_rate)*100:.1f}%)")
+    print(f"  Completion tokens:           {total_completion:>12,}")
+    print(f"  Avg encode:decode ratio:     {actual_ratio:>11.0f}:1  (target: {args.encode_decode_ratio}:1)")
+    print(f"  Avg prompt tokens/req:       {avg_prompt:>11,.0f}")
+    print(f"  Avg completion tokens/req:   {avg_completion:>11,.0f}")
+    print(f"\n  ── Latency ──")
+    print(f"  Avg TTFT:                    {avg_ttft_ms:>8.0f} ms")
+    print(f"  Avg total latency/req:       {avg_elapsed_ms:>8.0f} ms")
+    avg_decode_ms = avg_elapsed_ms - avg_ttft_ms
+    avg_toks_per_s = (avg_completion / avg_decode_ms * 1000) if avg_decode_ms > 0 else 0
+    print(f"  Avg decode throughput:       {avg_toks_per_s:>8.1f} tok/s")
+    print(f"\n  ── Billing ──")
+    print(f"  Input cost:                  ${input_cost/100:.4f}")
+    print(f"  Output cost:                 ${output_cost/100:.4f}")
+    print(f"  Total cost:                  ${total_cost/100:.4f}")
+    print("=" * 80)
+
+    # Save results
+    out = {
+        "config": {
+            "gateway_url": GATEWAY_URL, "users": USERS,
+            "doc_tokens_min": DOC_TOKENS_MIN, "doc_tokens_max": DOC_TOKENS_MAX,
+            "session_min_turns": SESSION_MIN_TURNS, "session_max_turns": SESSION_MAX_TURNS,
+            "session_max_tokens": SESSION_MAX_TOKENS,
+            "encode_decode_ratio": ENCODE_DECODE_RATIO,
+            "run_duration_s": RUN_DURATION_S,
+        },
+        "stop_reason": stop_reason,
+        "summary": {
+            "requests": len(results),
+            "total_prompt_tokens": total_prompt,
+            "total_cached_tokens": total_cached,
+            "total_uncached_tokens": total_uncached,
+            "total_completion_tokens": total_completion,
+            "wall_ms": wall_ms,
+            "cache_hit_rate": hit_rate,
+            "actual_encode_decode_ratio": actual_ratio,
+            "cost_cents": total_cost,
+        },
+        "requests": [
+            {
+                "user": r.user_num, "session": r.session_num,
+                "session_req": r.session_req, "task": r.task,
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "ttft_ms": round(r.ttft_ms, 1),
+                "elapsed_ms": round(r.elapsed_ms, 1),
+                "output_preview": r.output[:120],
+            }
+            for r in results
+        ],
+    }
+    with open("workload_results.json", "w") as f:
+        json.dump(out, f, indent=2)
+    print("\nResults saved to workload_results.json")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()

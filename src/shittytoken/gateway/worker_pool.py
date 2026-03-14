@@ -30,6 +30,8 @@ class WorkerState:
     requests_running: int = 0
     requests_waiting: int = 0
     kv_cache_pct: float = 0.0
+    prefix_cache_hits: float = 0.0
+    prefix_cache_queries: float = 0.0
     healthy: bool = True
     added_at: float = field(default_factory=time.monotonic)
 
@@ -148,8 +150,14 @@ class WorkerPool:
         requests_running = int(parsed.get("vllm:num_requests_running", parsed.get("num_requests_running", 0)))
         requests_waiting = int(parsed.get("vllm:num_requests_waiting", parsed.get("num_requests_waiting", 0)))
         kv_cache_pct = parsed.get("vllm:kv_cache_usage_perc", parsed.get("kv_cache_usage_perc", 0.0))
+        cache_hits = parsed.get("vllm:prefix_cache_hits_total", 0.0)
+        cache_queries = parsed.get("vllm:prefix_cache_queries_total", 0.0)
 
         self.report_metrics(url, requests_running, kv_cache_pct, requests_waiting)
+        worker = self._workers.get(url)
+        if worker is not None:
+            worker.prefix_cache_hits = cache_hits
+            worker.prefix_cache_queries = cache_queries
 
         # Successful scrape — reset failure counter and mark healthy.
         self._consecutive_failures[url] = 0

@@ -222,6 +222,16 @@ async def handle_metrics(request: web.Request) -> web.Response:
         lines.append("# TYPE shittytoken_workers_total gauge")
         lines.append(f"shittytoken_workers_total {len(workers)}")
 
+        # Prefix cache (scraped from workers)
+        total_cache_hits = sum(w.prefix_cache_hits for w in workers)
+        total_cache_queries = sum(w.prefix_cache_queries for w in workers)
+        lines.append("# HELP shittytoken_prefix_cache_hits_total Prefix cache hits (tokens).")
+        lines.append("# TYPE shittytoken_prefix_cache_hits_total counter")
+        lines.append(f"shittytoken_prefix_cache_hits_total {total_cache_hits}")
+        lines.append("# HELP shittytoken_prefix_cache_queries_total Prefix cache queries (tokens).")
+        lines.append("# TYPE shittytoken_prefix_cache_queries_total counter")
+        lines.append(f"shittytoken_prefix_cache_queries_total {total_cache_queries}")
+
         # Per-worker request totals
         lines.append("# HELP shittytoken_worker_requests_total Total requests routed to each worker.")
         lines.append("# TYPE shittytoken_worker_requests_total counter")
