@@ -476,6 +476,15 @@
           "url": "http://host.docker.internal:8001/admin/requests",
           "format": "table",
           "root_selector": "",
+          "url_options": {
+            "method": "GET",
+            "headers": [],
+            "params": [],
+            "body_type": "",
+            "body_content_type": "",
+            "body_form": [],
+            "data": ""
+          },
           "columns": [
             { "selector": "ts", "text": "ts", "type": "timestamp_epoch_s" },
             { "selector": "request_id", "text": "request_id", "type": "string" },
