@@ -716,7 +716,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_scale_events_total[5m])",
+          "expr": "increase(shittytoken_scale_events_total[5m])",
           "legendFormat": "{{type}}",
           "refId": "A"
         }
