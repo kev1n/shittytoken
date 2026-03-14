@@ -154,6 +154,16 @@ class TestBuildVllmCommand:
         assert "--gpu-memory-utilization 0.85" in cmd
         assert "--max-num-seqs 128" in cmd
 
+    def test_lmcache_kv_transfer_config_present(self):
+        """When lmcache is enabled in config, --kv-transfer-config must appear."""
+        cmd = build_vllm_command(_make_config(), MODEL_ID)
+        lmcache_cfg = cfg.get("vllm", {}).get("lmcache", {})
+        if lmcache_cfg.get("enabled", False):
+            assert "--kv-transfer-config" in cmd
+            assert "LMCacheConnectorV1" in cmd
+        else:
+            assert "--kv-transfer-config" not in cmd
+
     def test_output_is_string_starting_with_vllm_serve(self):
         cmd = build_vllm_command(_make_config(), MODEL_ID)
         assert isinstance(cmd, str)

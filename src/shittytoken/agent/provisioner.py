@@ -98,6 +98,14 @@ def build_vllm_command(config: Configuration, model_id: str) -> str:
     if config.enforce_eager:
         parts.append("--enforce-eager")
 
+    # LMCache KV connector — offloads evicted KV cache to CPU RAM
+    _lmcache = _vllm.get("lmcache", {})
+    if _lmcache.get("enabled", False):
+        import json as _json
+
+        kv_config = {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both"}
+        parts += ["--kv-transfer-config", _json.dumps(kv_config)]
+
     # Extra CLI args from config
     extra_args = _vllm.get("extra_args", [])
     if extra_args:
@@ -264,6 +272,26 @@ class DeploymentPlan:
             f"    max_num_seqs:           {self.max_num_seqs}",
             f"    enable_prefix_caching:  {self.enable_prefix_caching}",
             f"    enforce_eager:          {self.enforce_eager}",
+        ]
+
+        # LMCache info
+        _lmcache = cfg.get("vllm", {}).get("lmcache", {})
+        if _lmcache.get("enabled", False):
+            lines.append("")
+            lines.append("  LMCache (CPU KV offload):")
+            lines.append(f"    chunk_size:             {_lmcache.get('chunk_size', 256)}")
+            max_cpu = _lmcache.get("max_cpu_size_gb", "auto")
+            if max_cpu == "auto":
+                cpu_ram = o.raw.get("cpu_ram")
+                reserve = _lmcache.get("cpu_reserve_gb", 8.0)
+                if cpu_ram and cpu_ram > reserve:
+                    lines.append(f"    cpu_cache_size:         {round(cpu_ram - reserve, 1)} GB (auto: {cpu_ram} GB RAM - {reserve} GB reserve)")
+                else:
+                    lines.append(f"    cpu_cache_size:         auto (machine RAM unknown)")
+            else:
+                lines.append(f"    cpu_cache_size:         {max_cpu} GB")
+
+        lines += [
             "",
             "  Command:",
             f"    {self.vllm_command}",
@@ -432,6 +460,39 @@ class VastAIProvider(GPUProvider):
             ]
         for k, v in _vllm_cfg.get("env", {}).items():
             env_parts.append(f"-e {k}={v}")
+
+        # LMCache env vars — CPU RAM KV cache offloading
+        _lmcache = _vllm_cfg.get("lmcache", {})
+        if _lmcache.get("enabled", False):
+            chunk_size = _lmcache.get("chunk_size", 256)
+            env_parts += [
+                f"-e LMCACHE_CHUNK_SIZE={chunk_size}",
+                "-e LMCACHE_LOCAL_CPU=True",
+            ]
+            max_cpu = _lmcache.get("max_cpu_size_gb", "auto")
+            if max_cpu != "auto":
+                env_parts.append(f"-e LMCACHE_MAX_LOCAL_CPU_SIZE={max_cpu}")
+            else:
+                # Auto-detect: use machine's CPU RAM minus reserve
+                cpu_ram_gb = offer.raw.get("cpu_ram", 0)
+                reserve_gb = _lmcache.get("cpu_reserve_gb", 8.0)
+                if cpu_ram_gb > reserve_gb:
+                    auto_size = round(cpu_ram_gb - reserve_gb, 1)
+                    env_parts.append(f"-e LMCACHE_MAX_LOCAL_CPU_SIZE={auto_size}")
+                    logger.info(
+                        "lmcache_cpu_auto_sized",
+                        machine_cpu_ram_gb=cpu_ram_gb,
+                        reserve_gb=reserve_gb,
+                        lmcache_cpu_size_gb=auto_size,
+                    )
+                else:
+                    logger.warning(
+                        "lmcache_cpu_ram_too_low",
+                        machine_cpu_ram_gb=cpu_ram_gb,
+                        reserve_gb=reserve_gb,
+                        msg="Falling back to LMCache default CPU size",
+                    )
+
         env_str = " ".join(env_parts)
 
         # Snapshot existing instance IDs so we can detect the new one
@@ -1091,6 +1152,19 @@ class RunPodProvider(GPUProvider):
         entries = ""
         for k, v in vllm_cfg.get("env", {}).items():
             entries += f', {{key: "{k}", value: "{v}"}}'
+
+        # LMCache env vars for CPU KV cache offloading
+        _lmcache = vllm_cfg.get("lmcache", {})
+        if _lmcache.get("enabled", False):
+            chunk_size = _lmcache.get("chunk_size", 256)
+            entries += f', {{key: "LMCACHE_CHUNK_SIZE", value: "{chunk_size}"}}'
+            entries += ', {key: "LMCACHE_LOCAL_CPU", value: "True"}'
+            max_cpu = _lmcache.get("max_cpu_size_gb", "auto")
+            if max_cpu == "auto":
+                # RunPod doesn't expose host RAM in offers — use conservative default
+                max_cpu = 32.0
+            entries += f', {{key: "LMCACHE_MAX_LOCAL_CPU_SIZE", value: "{max_cpu}"}}'
+
         return entries
 
     @staticmethod

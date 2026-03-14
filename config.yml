@@ -63,6 +63,17 @@ vllm:
   # pip packages to install before starting vLLM
   pre_install:
     - "fastsafetensors"
+    - "lmcache"
+
+  # LMCache — CPU RAM KV cache offloading.
+  # Spills evicted KV cache entries to host CPU RAM so they can be reloaded
+  # instead of recomputed. max_cpu_size_gb is auto-detected from the machine's
+  # available RAM if set to "auto" (leaves a reserve for OS + vLLM overhead).
+  lmcache:
+    enabled: true
+    chunk_size: 256
+    max_cpu_size_gb: "auto"     # or a fixed number like 32.0
+    cpu_reserve_gb: 10.0        # RAM to leave free when auto-detecting
 
   # Extra CLI flags passed directly to vllm serve
   extra_args:
