@@ -132,9 +132,21 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "sum by (type) (rate(shittytoken_tokens_total[5m]))",
-          "legendFormat": "{{type}}",
+          "expr": "rate(shittytoken_tokens_total{type=\"uncached\"}[5m])",
+          "legendFormat": "uncached input",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"cached\"}[5m])",
+          "legendFormat": "cached input",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"completion\"}[5m])",
+          "legendFormat": "output",
+          "refId": "C"
         }
       ],
       "title": "Token Throughput",
@@ -144,37 +156,65 @@
       "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false, "axisLabel": "$/hr",
-            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
-            "lineWidth": 2, "showPoints": "never", "spanNulls": false
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 5 },
+              { "color": "red", "value": 20 }
+            ]
           },
-          "unit": "currencyUSD", "decimals": 4
+          "unit": "currencyUSD", "decimals": 2
         }
       },
-      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
       "id": 3,
       "options": {
-        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "colorMode": "background", "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "auto"
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
           "expr": "shittytoken_hourly_burn_usd",
-          "legendFormat": "GPU burn",
+          "legendFormat": "GPU $/hr",
           "refId": "A"
-        },
+        }
+      ],
+      "title": "GPU Burn ($/hr)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          },
+          "unit": "currencyUSD", "decimals": 2
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 5 },
+      "id": 34,
+      "options": {
+        "colorMode": "background", "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "auto"
+      },
+      "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
           "expr": "shittytoken_cumulative_cost_usd",
-          "legendFormat": "cumulative",
-          "refId": "B"
+          "legendFormat": "Total",
+          "refId": "A"
         }
       ],
-      "title": "GPU Cost ($/hr + cumulative)",
-      "type": "timeseries"
+      "title": "Cumulative Cost",
+      "type": "stat"
     },
 
     {
@@ -191,7 +231,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
       "id": 30,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -218,80 +258,17 @@
       "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
       "fieldConfig": {
         "defaults": {
-          "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.3 },
-              { "color": "green", "value": 0.6 }
-            ]
-          },
-          "unit": "percentunit", "min": 0, "max": 1, "decimals": 1
-        }
-      },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 9 },
-      "id": 31,
-      "options": {
-        "colorMode": "background", "graphMode": "area",
-        "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"cached\"}[5m]) / (rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) > 0)",
-          "legendFormat": "hit rate",
-          "refId": "A"
-        }
-      ],
-      "title": "Prefix Cache Hit Rate",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-      "fieldConfig": {
-        "defaults": {
           "color": { "mode": "palette-classic" },
           "custom": {
-            "axisBorderShow": false, "axisLabel": "hit rate",
-            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
-            "lineWidth": 2, "showPoints": "never", "spanNulls": false
-          },
-          "unit": "percentunit", "min": 0, "max": 1
-        }
-      },
-      "gridPos": { "h": 8, "w": 8, "x": 12, "y": 9 },
-      "id": 32,
-      "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"cached\"}[5m]) / (rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) > 0)",
-          "legendFormat": "cache hit rate",
-          "refId": "A"
-        }
-      ],
-      "title": "Prefix Cache Hit Rate Over Time",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false, "axisLabel": "$/min",
+            "axisBorderShow": false, "axisLabel": "$/hr",
             "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
             "lineWidth": 2, "showPoints": "never", "spanNulls": false,
-            "stacking": { "group": "A", "mode": "normal" }
+            "stacking": { "group": "A", "mode": "none" }
           },
           "unit": "currencyUSD", "decimals": 4
         }
       },
-      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
       "id": 33,
       "options": {
         "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom" },
@@ -300,18 +277,30 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) * 3600 / 1000000 * 2.5 / 100",
-          "legendFormat": "input",
+          "expr": "shittytoken_hourly_burn_usd",
+          "legendFormat": "GPU cost",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"completion\"}[5m]) * 3600 / 1000000 * 15 / 100",
-          "legendFormat": "output",
+          "expr": "rate(shittytoken_tokens_total{type=\"uncached\"}[5m]) * 3600 / 1000000 * 2.5 / 100",
+          "legendFormat": "uncached input revenue",
           "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"cached\"}[5m]) * 3600 / 1000000 * 2.5 / 100",
+          "legendFormat": "cached input revenue",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
+          "expr": "rate(shittytoken_tokens_total{type=\"completion\"}[5m]) * 3600 / 1000000 * 15 / 100",
+          "legendFormat": "output revenue",
+          "refId": "D"
         }
       ],
-      "title": "API Revenue ($/hr)",
+      "title": "Cost vs Revenue ($/hr)",
       "type": "timeseries"
     },
 
@@ -335,7 +324,7 @@
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
       "id": 10,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -377,7 +366,7 @@
           "unit": "s"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
       "id": 11,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -409,7 +398,106 @@
 
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "id": 104,
+      "title": "Request Log",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "shittytoken-infinity" },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "ts" },
+            "properties": [
+              { "id": "custom.width", "value": 160 },
+              { "id": "unit", "value": "dateTimeFromNow" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "duration_ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "custom.width", "value": 100 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 2000 },
+                { "color": "red", "value": 10000 }
+              ]}},
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "cost_usd" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "decimals", "value": 6 },
+              { "id": "custom.width", "value": 110 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "request_id" },
+            "properties": [
+              { "id": "custom.width", "value": 120 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "worker" },
+            "properties": [
+              { "id": "custom.width", "value": 180 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "status" },
+            "properties": [
+              { "id": "custom.width", "value": 70 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [
+                { "color": "green", "value": null },
+                { "color": "red", "value": 400 }
+              ]}},
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 27 },
+      "id": 35,
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "ts", "desc": true }],
+        "footer": { "show": true, "reducer": ["sum"], "fields": ["cost_usd"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "yesoreyeram-infinity-datasource", "uid": "shittytoken-infinity" },
+          "type": "json",
+          "source": "url",
+          "url": "http://host.docker.internal:8001/admin/requests",
+          "format": "table",
+          "root_selector": "",
+          "columns": [
+            { "selector": "ts", "text": "ts", "type": "timestamp_epoch_s" },
+            { "selector": "request_id", "text": "request_id", "type": "string" },
+            { "selector": "status", "text": "status", "type": "number" },
+            { "selector": "duration_ms", "text": "duration_ms", "type": "number" },
+            { "selector": "uncached_tokens", "text": "uncached_tokens", "type": "number" },
+            { "selector": "cached_tokens", "text": "cached_tokens", "type": "number" },
+            { "selector": "output_tokens", "text": "output_tokens", "type": "number" },
+            { "selector": "total_tokens", "text": "total_tokens", "type": "number" },
+            { "selector": "cost_usd", "text": "cost_usd", "type": "number" },
+            { "selector": "worker", "text": "worker", "type": "string" }
+          ],
+          "refId": "A"
+        }
+      ],
+      "title": "Recent Requests",
+      "type": "table"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
       "id": 102,
       "title": "Workers",
       "type": "row"
@@ -431,7 +519,7 @@
           ]
         }
       },
-      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 19 },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 27 },
       "id": 6,
       "options": {
         "colorMode": "background", "graphMode": "none",
@@ -463,7 +551,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
       "id": 12,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" },
@@ -493,7 +581,7 @@
           "unit": "none"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
       "id": 13,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -523,7 +611,7 @@
           "unit": "percentunit", "min": 0, "max": 1
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
       "id": 14,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
@@ -543,7 +631,7 @@
 
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
       "id": 103,
       "title": "Orchestrator",
       "type": "row"
@@ -562,7 +650,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
       "id": 15,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
@@ -610,7 +698,7 @@
           "unit": "short"
         }
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
       "id": 16,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" },
@@ -626,86 +714,6 @@
       ],
       "title": "Scaling Events",
       "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false, "axisLabel": "",
-            "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "smooth",
-            "lineWidth": 2, "showPoints": "never", "spanNulls": false,
-            "stacking": { "group": "A", "mode": "normal" }
-          },
-          "unit": "currencyUSD", "decimals": 4
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
-      "id": 17,
-      "options": {
-        "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "shittytoken_hourly_burn_usd",
-          "legendFormat": "GPU cost ($/hr)",
-          "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_tokens_total{type=\"prompt\"}[5m]) * 3600 / 1000000 * 2.5 / 100 + rate(shittytoken_tokens_total{type=\"completion\"}[5m]) * 3600 / 1000000 * 15 / 100",
-          "legendFormat": "API revenue ($/hr)",
-          "refId": "B"
-        }
-      ],
-      "title": "Cost vs Revenue ($/hr)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false, "axisLabel": "seconds",
-            "drawStyle": "points", "fillOpacity": 0,
-            "lineWidth": 0, "showPoints": "always", "pointSize": 4,
-            "spanNulls": false
-          },
-          "unit": "s"
-        }
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
-      "id": 18,
-      "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "histogram_quantile(0.50, rate(shittytoken_request_duration_seconds_bucket[1m]))",
-          "legendFormat": "p50 (1m)",
-          "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "histogram_quantile(0.99, rate(shittytoken_request_duration_seconds_bucket[1m]))",
-          "legendFormat": "p99 (1m)",
-          "refId": "B"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "shittytoken-prometheus" },
-          "expr": "rate(shittytoken_request_duration_seconds_sum[1m]) / rate(shittytoken_request_duration_seconds_count[1m])",
-          "legendFormat": "avg (1m)",
-          "refId": "C"
-        }
-      ],
-      "title": "Per-Request Latency (1m window)",
-      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -717,5 +725,5 @@
   "timezone": "browser",
   "title": "ShittyToken Overview",
   "uid": "shittytoken-overview",
-  "version": 2
+  "version": 3
 }

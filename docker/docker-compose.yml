@@ -89,6 +89,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: shittytoken
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_INSTALL_PLUGINS: yesoreyeram-infinity-datasource
     volumes:
       - ../config/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../config/grafana/shittytoken.json:/var/lib/grafana/dashboards/shittytoken.json:ro

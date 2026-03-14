@@ -8,6 +8,7 @@ buffering.  Extracts token usage from the final SSE chunk for metrics.
 
 from __future__ import annotations
 
+import collections
 import json
 import time
 from typing import Any, Callable, Awaitable, TYPE_CHECKING
@@ -24,6 +25,49 @@ from shittytoken.gateway.routing_policy import CacheAwarePolicy
 from shittytoken.gateway import prom_metrics
 
 logger = structlog.get_logger()
+
+# ---------------------------------------------------------------------------
+# Per-request ring buffer — most recent N requests for /admin/requests
+# ---------------------------------------------------------------------------
+
+_REQUEST_LOG: collections.deque[dict] = collections.deque(maxlen=200)
+
+# Pricing constants ($/token) — adjust if cached tokens are priced differently
+_PRICE_INPUT = 2.5 / 100 / 1_000_000   # $0.025 per 1M input tokens
+_PRICE_CACHED = 2.5 / 100 / 1_000_000  # same rate for now — change if discounted
+_PRICE_OUTPUT = 15.0 / 100 / 1_000_000  # $0.15 per 1M output tokens
+
+
+async def _log_request(
+    request_id: str | None,
+    worker_url: str,
+    duration_sec: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int,
+    status: int,
+) -> None:
+    """Append a completed request to the ring buffer."""
+    uncached = prompt_tokens - cached_tokens
+    cost = uncached * _PRICE_INPUT + cached_tokens * _PRICE_CACHED + completion_tokens * _PRICE_OUTPUT
+    entry = {
+        "ts": time.time(),
+        "request_id": request_id,
+        "worker": worker_url,
+        "status": status,
+        "duration_ms": round(duration_sec * 1000, 1),
+        "uncached_tokens": uncached,
+        "cached_tokens": cached_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "cost_usd": round(cost, 8),
+    }
+    _REQUEST_LOG.append(entry)
+
+
+def get_request_log() -> list[dict]:
+    """Return a copy of the ring buffer (newest last)."""
+    return list(_REQUEST_LOG)
 
 
 def _upstream_unavailable() -> web.Response:
@@ -197,20 +241,22 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         upstream_resp.release()
         prom_metrics.dec_active()
         prom_metrics.inc_request("POST", 200)
-        prom_metrics.observe_latency(time.monotonic() - request_start)
+        duration = time.monotonic() - request_start
+        prom_metrics.observe_latency(duration)
+        prompt_tok = 0
+        completion_tok = 0
+        cached_tok = 0
         try:
             resp_json = json.loads(resp_body)
             usage = resp_json.get("usage", {})
             ptd = usage.get("prompt_tokens_details") or {}
-            cached = ptd.get("cached_tokens", 0)
-            await _record_usage(
-                usage.get("prompt_tokens", 0),
-                usage.get("completion_tokens", 0),
-                on_usage,
-                cached_tokens=cached,
-            )
+            cached_tok = ptd.get("cached_tokens", 0)
+            prompt_tok = usage.get("prompt_tokens", 0)
+            completion_tok = usage.get("completion_tokens", 0)
+            await _record_usage(prompt_tok, completion_tok, on_usage, cached_tokens=cached_tok)
         except (json.JSONDecodeError, AttributeError):
             pass
+        await _log_request(request_id, worker.url, duration, prompt_tok, completion_tok, cached_tok, 200)
         return web.Response(
             text=resp_body,
             status=200,
@@ -226,12 +272,18 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             "X-Accel-Buffering": "no",
         },
     )
-    await response.prepare(request)
+    try:
+        await response.prepare(request)
+    except Exception:
+        upstream_resp.release()
+        prom_metrics.dec_active()
+        raise
 
     last_data_line: str | None = None
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    stream_error = False
 
     try:
         async for raw_chunk in upstream_resp.content:
@@ -262,6 +314,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                     else:
                         last_data_line = data_str
     except Exception as exc:
+        stream_error = True
         logger.error(
             "proxy.mid_stream_error",
             worker=worker.url,
@@ -269,21 +322,20 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
-        # Close client connection on mid-stream failure.
-        await response.write_eof()
+    finally:
         upstream_resp.release()
         prom_metrics.dec_active()
-        return response
+        if not stream_error:
+            prom_metrics.inc_request("POST", 200)
+        duration = time.monotonic() - request_start
+        prom_metrics.observe_latency(duration)
+        await _record_usage(prompt_tokens, completion_tokens, on_usage, cached_tokens=cached_tokens)
+        await _log_request(request_id, worker.url, duration, prompt_tokens, completion_tokens, cached_tokens, 200 if not stream_error else 500)
 
-    upstream_resp.release()
-
-    # ---- metrics & billing ------------------------------------------------
-    prom_metrics.dec_active()
-    prom_metrics.inc_request("POST", 200)
-    prom_metrics.observe_latency(time.monotonic() - request_start)
-    await _record_usage(prompt_tokens, completion_tokens, on_usage, cached_tokens=cached_tokens)
-
-    await response.write_eof()
+    try:
+        await response.write_eof()
+    except Exception:
+        pass
     return response
 
 

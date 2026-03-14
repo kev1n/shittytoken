@@ -160,11 +160,15 @@ async def handle_metrics(request: web.Request) -> web.Response:
     lines.append(
         f'shittytoken_tokens_total{{type="prompt"}} {_tokens_total["prompt"]}'
     )
+    uncached = _tokens_total["prompt"] - _tokens_total["cached"]
     lines.append(
-        f'shittytoken_tokens_total{{type="completion"}} {_tokens_total["completion"]}'
+        f'shittytoken_tokens_total{{type="uncached"}} {uncached}'
     )
     lines.append(
         f'shittytoken_tokens_total{{type="cached"}} {_tokens_total["cached"]}'
+    )
+    lines.append(
+        f'shittytoken_tokens_total{{type="completion"}} {_tokens_total["completion"]}'
     )
 
     # -- shittytoken_request_duration_seconds (histogram) ------------------
@@ -217,10 +221,11 @@ async def handle_metrics(request: web.Request) -> web.Response:
             health_val = 1 if w.healthy else 0
             lines.append(f'shittytoken_worker_health{{url="{w.url}"}} {health_val}')
 
-        # Worker count
-        lines.append("# HELP shittytoken_workers_total Total number of registered workers.")
+        # Worker count (healthy only — this is what matters for capacity)
+        healthy_count = sum(1 for w in workers if w.healthy)
+        lines.append("# HELP shittytoken_workers_total Number of healthy workers.")
         lines.append("# TYPE shittytoken_workers_total gauge")
-        lines.append(f"shittytoken_workers_total {len(workers)}")
+        lines.append(f"shittytoken_workers_total {healthy_count}")
 
         # Prefix cache (scraped from workers)
         total_cache_hits = sum(w.prefix_cache_hits for w in workers)

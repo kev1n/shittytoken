@@ -7,3 +7,11 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: true
+
+  - name: Gateway API
+    type: yesoreyeram-infinity-datasource
+    uid: shittytoken-infinity
+    access: proxy
+    editable: true
+    jsonData:
+      global_queries: []

@@ -160,3 +160,18 @@ async def update_orchestrator_metrics(request: web.Request) -> web.Response:
         )
 
     return web.json_response({"status": "ok"}, status=200)
+
+
+async def list_requests(request: web.Request) -> web.Response:
+    """GET /admin/requests -> 200 [{ts, request_id, worker, status, duration_ms, ...}].
+
+    Returns the most recent 200 requests (newest last) with per-request
+    token breakdown and cost.
+    """
+    denied = _check_admin_token(request)
+    if denied is not None:
+        return denied
+
+    from shittytoken.gateway.proxy import get_request_log
+
+    return web.json_response(get_request_log(), status=200)
