@@ -388,6 +388,7 @@ class VastAIProvider(GPUProvider):
             o for o in raw_offers
             if o.get("gpu_name", "").lower() in gpu_names_lower
             and int(o.get("num_gpus", 0)) >= min_gpus
+            and float(o.get("gpu_frac", 1.0)) >= 1.0  # no shared GPUs
         ]
 
         offers = [self._to_gpu_offer(o) for o in raw_offers]
@@ -448,8 +449,8 @@ class VastAIProvider(GPUProvider):
         else:
             startup_cmd = vllm_command
 
-        # Volume handling — check for existing volume on this machine
-        create_kwargs: dict[str, Any] = {}
+        # Volume handling — check for existing volume or create new one
+        volume_info: dict[str, Any] | None = None
         if vol_enabled:
             machine_id = offer.raw.get("machine_id")
             if machine_id:
@@ -462,32 +463,48 @@ class VastAIProvider(GPUProvider):
                         machine_id=machine_id,
                         disk_space=existing_vol.get("disk_space"),
                     )
-                    create_kwargs["link_volume"] = vol_id
-                    create_kwargs["mount_path"] = mount_path
+                    volume_info = {
+                        "mount_path": mount_path,
+                        "create_new": False,
+                        "volume_id": vol_id,
+                    }
                 else:
-                    vol_size = vol_cfg.get("size_gb", 40)
-                    label = f"{vol_cfg.get('label_prefix', 'st-cache')}-{machine_id}"
-                    logger.info(
-                        "vastai_volume_creating",
-                        machine_id=machine_id,
-                        size_gb=vol_size,
-                        label=label,
-                    )
-                    create_kwargs["create_volume"] = int(offer.offer_id)
-                    create_kwargs["mount_path"] = mount_path
-                    create_kwargs["volume_size"] = vol_size
-                    create_kwargs["volume_label"] = label
+                    vol_offer_id = await self._find_volume_offer_for_machine(machine_id)
+                    if vol_offer_id:
+                        vol_size = vol_cfg.get("size_gb", 40)
+                        # Vast.ai labels must be alphanumeric (no hyphens/underscores)
+                        label_prefix = vol_cfg.get("label_prefix", "st-cache").replace("-", "")
+                        label = f"{label_prefix}{machine_id}"
+                        logger.info(
+                            "vastai_volume_creating",
+                            machine_id=machine_id,
+                            vol_offer_id=vol_offer_id,
+                            size_gb=vol_size,
+                            label=label,
+                        )
+                        volume_info = {
+                            "mount_path": mount_path,
+                            "create_new": True,
+                            "volume_id": vol_offer_id,
+                            "size": vol_size,
+                            "name": label,
+                        }
+                    else:
+                        logger.info(
+                            "vastai_volume_no_offer",
+                            machine_id=machine_id,
+                            msg="No volume storage available on this machine, skipping cache",
+                        )
 
-        result = await asyncio.to_thread(
-            self._client.create_instance,
-            id=int(offer.offer_id),
-            image=docker_image,
-            disk=disk_gb,
-            ssh=True,
-            direct=True,
+        # Use direct REST API for instance creation — the SDK silently
+        # swallows volume-related errors and returns empty strings.
+        result = await self._create_instance_api(
+            offer_id=int(offer.offer_id),
+            docker_image=docker_image,
+            disk_gb=disk_gb,
             onstart_cmd=startup_cmd,
-            env=env_str,
-            **create_kwargs,
+            env_str=env_str,
+            volume_info=volume_info,
         )
 
         logger.debug("vastai_create_instance_response", result=repr(result)[:500])
@@ -581,6 +598,78 @@ class VastAIProvider(GPUProvider):
         if isinstance(result, list):
             return result
         return []
+
+    async def _create_instance_api(
+        self,
+        offer_id: int,
+        docker_image: str,
+        disk_gb: int,
+        onstart_cmd: str,
+        env_str: str,
+        volume_info: dict[str, Any] | None = None,
+    ) -> dict | None:
+        """Create an instance via the Vast.ai REST API directly.
+
+        The SDK's ``create_instance`` silently swallows errors when volume
+        params are invalid, so we use the REST API for reliability.
+        """
+        import requests as _requests
+
+        # Parse env string "-e K=V -e K2=V2" into dict
+        env_dict: dict[str, str] = {}
+        parts = env_str.split("-e ")
+        for part in parts:
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                env_dict[k.strip()] = v.strip()
+
+        json_blob: dict[str, Any] = {
+            "client_id": "me",
+            "image": docker_image,
+            "env": env_dict,
+            "disk": disk_gb,
+            "onstart": onstart_cmd,
+            "runtype": "ssh_direc ssh_proxy",
+        }
+        if volume_info:
+            json_blob["volume_info"] = volume_info
+
+        url = f"https://console.vast.ai/api/v0/asks/{offer_id}/"
+        headers = {
+            "Authorization": f"Bearer {self._client.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        def _do_request():
+            r = _requests.put(url, headers=headers, json=json_blob, timeout=30)
+            r.raise_for_status()
+            return r.json()
+
+        result = await asyncio.to_thread(_do_request)
+        if isinstance(result, dict) and result.get("success"):
+            return result
+        logger.error("vastai_create_instance_api_failed", result=result)
+        return None
+
+    async def _find_volume_offer_for_machine(self, machine_id: int) -> int | None:
+        """Find a volume offer (storage capacity) on a specific machine.
+
+        Returns the volume offer ID suitable for ``create_instance --create-volume``,
+        or None if the machine has no available volume storage.
+        """
+        try:
+            results = await asyncio.to_thread(
+                self._client.search_volumes,
+                query=f"machine_id={machine_id}",
+            )
+            if isinstance(results, list):
+                for r in results:
+                    if r.get("machine_id") == machine_id:
+                        return int(r["id"])
+        except Exception as exc:
+            logger.warning("vastai_volume_offer_search_failed", machine_id=machine_id, error=str(exc))
+        return None
 
     async def find_volume_for_machine(self, machine_id: int) -> dict | None:
         """Find an existing shittytoken cache volume on a specific machine."""

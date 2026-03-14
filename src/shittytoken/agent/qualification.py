@@ -304,18 +304,36 @@ async def _verify_gpu(
     )
     import asyncssh
 
-    try:
-        session = await ssh_manager.connect(
-            host=record.ssh_host,
-            port=record.ssh_port,
-            username=record.ssh_user,
-        )
-    except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
+    ssh_timeout = cfg.get("orchestrator", {}).get("ssh_ready_timeout_s", 600)
+    max_ssh_attempts = ssh_timeout // 10
+    session = None
+    last_exc = None
+    for attempt in range(max_ssh_attempts):
+        try:
+            session = await ssh_manager.connect(
+                host=record.ssh_host,
+                port=record.ssh_port,
+                username=record.ssh_user,
+            )
+            break
+        except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            if attempt % 3 == 2:
+                logger.info(
+                    "provision_ssh_retrying",
+                    instance_id=record.instance_id,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+            await asyncio.sleep(10)
+
+    if session is None:
         logger.error(
             "provision_ssh_connect_failed",
             instance_id=record.instance_id,
-            error=str(exc),
-            error_type=type(exc).__name__,
+            error=str(last_exc),
+            error_type=type(last_exc).__name__,
+            attempts=max_ssh_attempts,
         )
         sm.transition(InstanceState.FAILED, reason="ssh_connect_failed")
         return None

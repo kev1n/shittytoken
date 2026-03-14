@@ -145,7 +145,7 @@ orchestrator:
     mount_path: "/cache"
     size_gb: 40
     eviction_days: 3          # delete volumes unused for this many days
-    label_prefix: "st-cache"  # volume label prefix for identification
+    label_prefix: "stcache"  # volume label prefix (alphanumeric only, Vast.ai requirement)
 
   # RunPod-specific settings (spot only)
   runpod:
